@@ -86,17 +86,28 @@ jobs:
           "version=$ver" >> $env:GITHUB_OUTPUT
           "kind=$kind" >> $env:GITHUB_OUTPUT
 
-      # Prerequisite checks, tests, release build, dist\Passthrify + dist\Passthrify-<ver>.zip
+      # The runner image normally ships Inno Setup 6; install it if this one doesn't.
+      - name: Inno Setup
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue) -and -not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+
+      # Prerequisite checks, tests, release build, dist\Passthrify + the zip + the setup exe
       - name: Test, build and package
-        run: ./build.ps1 -Zip
+        run: ./build.ps1 -Zip -Installer
 
       - name: Checksum
         id: checksum
         run: |
-          $zip = "dist/Passthrify-${{ steps.version.outputs.version }}.zip"
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $(Split-Path $zip -Leaf)" | Out-File -Encoding ascii "$zip.sha256"
-          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          $ver = "${{ steps.version.outputs.version }}"
+          foreach ($file in "dist/Passthrify-$ver.zip", "dist/Passthrify-$ver-setup.exe") {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path $file -Leaf)" | Out-File -Encoding ascii "$file.sha256"
+          }
+          "sha256=$((Get-FileHash "dist/Passthrify-$ver.zip" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
+          "setup_sha256=$((Get-FileHash "dist/Passthrify-$ver-setup.exe" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
         with:
@@ -104,6 +115,8 @@ jobs:
           path: |
             dist/Passthrify-${{ steps.version.outputs.version }}.zip
             dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
+            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe
+            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe.sha256
           if-no-files-found: error
 
       # ---- Release (tag pushes and main) --------------------------------------------------
@@ -146,10 +159,16 @@ jobs:
             $changes
             ""
             "### Download"
-            "Unzip **$zip** anywhere and run ``passthrify.exe``. Needs Windows 10/11, an NVIDIA GPU"
-            "and an Elgato 4K-class capture card. Close Elgato 4K Capture Utility / OBS first."
+            "- **Passthrify-$env:VERSION-setup.exe**: installs Passthrify for your user (no admin needed),"
+            "  with a Start menu entry and an uninstaller. Windows may show a SmartScreen warning because"
+            "  the installer isn't code-signed: click **More info → Run anyway**."
+            "- **$zip**: portable; unzip anywhere and run ``passthrify.exe``."
             ""
-            "SHA-256: ``${{ steps.checksum.outputs.sha256 }}``"
+            "Needs Windows 10/11, an NVIDIA GPU and an Elgato 4K-class capture card. Close Elgato 4K"
+            "Capture Utility / OBS first. Installed and portable copies both update themselves."
+            ""
+            "SHA-256 (setup): ``${{ steps.checksum.outputs.setup_sha256 }}``"
+            "SHA-256 (zip): ``${{ steps.checksum.outputs.sha256 }}``"
           )
           if ($prev) {
             $notes += ""
@@ -170,6 +189,8 @@ jobs:
           prerelease: ${{ steps.version.outputs.kind == 'dev' || contains(steps.version.outputs.version, '-') }}
           make_latest: ${{ steps.version.outputs.kind == 'release' && !contains(steps.version.outputs.version, '-') }}
           files: |
+            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe
+            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe.sha256
             dist/Passthrify-${{ steps.version.outputs.version }}.zip
             dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
           fail_on_unmatched_files: true

@@ -5,6 +5,7 @@
 .EXAMPLE
     .\build.ps1                 # test + release build + dist\Passthrify
     .\build.ps1 -Zip            # also create dist\Passthrify-<version>.zip
+    .\build.ps1 -Installer      # also create dist\Passthrify-<version>-setup.exe (needs Inno Setup 6)
     .\build.ps1 -SkipTests -Run # build, package, then launch it
     .\build.ps1 -Dev            # debug build only (fast, with console), no packaging
     .\build.ps1 -Clean          # cargo clean + remove dist first
@@ -13,6 +14,7 @@
 param(
     [switch]$SkipTests,
     [switch]$Zip,
+    [switch]$Installer,
     [switch]$Run,
     [switch]$Dev,
     [switch]$Clean
@@ -130,6 +132,27 @@ if ($Zip) {
     if (Test-Path $zipOut) { Remove-Item $zipOut -Force }
     Compress-Archive -Path $dist -DestinationPath $zipOut
     Write-Host "  $zipOut"
+}
+
+if ($Installer) {
+    Write-Step 'Building installer'
+    $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+    if (-not $iscc) {
+        $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    }
+    if (-not $iscc) { Fail 'Inno Setup 6 not found. Install it (winget install JRSoftware.InnoSetup) or drop -Installer.' }
+    # The exe's icon, rendered by build.rs, doubles as the setup's icon.
+    $ico = Get-ChildItem (Join-Path $Root 'target\release\build') -Filter passthrify.ico -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $numeric = ($version -split '-')[0] # file version resources take digits only
+    $isccArgs = @("/DAppVersion=$version", "/DNumericVersion=$numeric", "/DSourceDir=$dist", "/DOutputDir=$(Join-Path $Root 'dist')", '/Q')
+    if ($ico) { $isccArgs += "/DIconFile=$($ico.FullName)" }
+    Invoke-Checked $iscc ($isccArgs + (Join-Path $Root 'installer\passthrify.iss'))
+    Write-Host "  dist\Passthrify-$version-setup.exe"
 }
 
 Write-Host "`nDone: $dist\passthrify.exe" -ForegroundColor Green

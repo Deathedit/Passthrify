@@ -4,6 +4,19 @@ Low-latency viewer for Elgato capture cards (4K X / 4K60 S+ / 4K60 Pro mk2) with
 ShadowPlay-style instant replay, manual recording, audio passthrough and screenshots.
 Rust, Media Foundation + WASAPI capture, NVENC encoding via FFmpeg, egui/wgpu UI.
 
+## Install
+
+Download from [Releases](https://github.com/Deathedit/Passthrify/releases):
+
+- **`Passthrify-<version>-setup.exe`** (recommended): installs for your user into
+  `%LOCALAPPDATA%\Programs\Passthrify`, no admin needed. Adds a Start menu entry (desktop icon
+  optional) and an entry in **Settings › Apps** to uninstall. Running a newer setup upgrades in
+  place. The installer isn't code-signed, so SmartScreen may warn: **More info → Run anyway**.
+- **`Passthrify-<version>.zip`**: portable. Unzip anywhere and run `passthrify.exe`.
+
+Both update themselves from inside the app (Settings › Updates). Uninstalling keeps your
+settings in `%APPDATA%\Passthrify`; delete that folder too for a clean slate.
+
 ## Use
 
 | Action | Default hotkey (global) |
@@ -66,6 +79,8 @@ downloads FFmpeg if it's missing, runs the tests, builds the release exe and pac
 ```
 .\build.ps1                  # test + release build + dist\Passthrify
 .\build.ps1 -Zip             # also dist\Passthrify-<version>.zip
+.\build.ps1 -Installer       # also dist\Passthrify-<version>-setup.exe (needs Inno Setup 6:
+                             #   winget install JRSoftware.InnoSetup)
 .\build.ps1 -SkipTests -Run  # build, package and launch
 .\build.ps1 -Dev -Run        # quick debug build with a log console
 .\build.ps1 -Clean           # start from scratch
@@ -102,7 +117,8 @@ Settings → **Updates** checks GitHub Releases at startup (can be turned off) o
   (`v0.1.1-dev.12`).
 - **Install and restart** downloads `Passthrify-<ver>.zip` and verifies it against the release's
   `.sha256`. It then restarts into the new version, keeping your settings and any other files
-  in the folder.
+  in the folder. For a copy installed with the setup it also updates the version shown in
+  Settings › Apps.
 - Builds check `Deathedit/Passthrify` (`PASSTHRIFY_REPO` in `.cargo/config.toml`; the workflow
   sets it from the repo it runs in, so a fork points at itself). To use another repo, set
   `update_repo = "owner/name"` in the app's config.toml. To check from the

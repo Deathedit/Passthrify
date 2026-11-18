@@ -329,6 +329,29 @@ fn copy_tree(from: &Path, to: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// If Passthrify was installed with the setup (installer/passthrify.iss, per-user), keeps its
+/// Apps & features entry at the version just installed in place. A no-op for zip installs.
+fn set_installed_version(version: &str) {
+    use windows::core::w;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    };
+    // `AppId` from installer/passthrify.iss, plus Inno Setup's "_is1" suffix.
+    let key_path = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{6BA996A8-2252-4F77-AFFE-17E5D77FE070}_is1");
+    let data: Vec<u8> = version.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, key_path, 0, KEY_SET_VALUE, &mut key) != ERROR_SUCCESS {
+            return;
+        }
+        if RegSetValueExW(key, w!("DisplayVersion"), 0, REG_SZ, Some(&data)) != ERROR_SUCCESS {
+            tracing::warn!("could not update the installed version in Apps & features");
+        }
+        let _ = RegCloseKey(key);
+    }
+}
+
 /// Entry point for `passthrify --apply-update --from DIR --to DIR --pid N --version V`.
 pub fn apply_update_main(args: &[String]) -> Result<()> {
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -347,6 +370,7 @@ pub fn apply_update_main(args: &[String]) -> Result<()> {
     let (status, msg) = match &result {
         Ok(n) => {
             tracing::info!("update {version}: replaced {n} files in {}", to.display());
+            set_installed_version(&version);
             ("ok", format!("Updated to Passthrify {version}"))
         }
         Err(e) => {
