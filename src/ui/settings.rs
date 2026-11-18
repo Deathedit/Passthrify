@@ -612,11 +612,24 @@ impl SettingsUi {
                         });
                     ui.add_space(8.0);
                     if let UpdateState::Downloading { progress, .. } = state {
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .text(format!("Downloading {:.0}%", progress * 100.0))
-                                .fill(theme::SIGNAL),
-                        );
+                        // Text above a thin bar: text on the cyan fill itself would be unreadable.
+                        let total_mb = rel.zip_size as f64 / 1_048_576.0;
+                        let done_mb = total_mb * progress as f64;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Downloading…").size(12.0).color(theme::TEXT2));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("{done_mb:.0} / {total_mb:.0} MB · {:.0}%", progress * 100.0))
+                                        .font(theme::mono(11.0))
+                                        .color(theme::TEXT),
+                                );
+                            });
+                        });
+                        let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), egui::Sense::hover());
+                        ui.painter().rect_filled(bar, 3, theme::LINE);
+                        let mut fill = bar;
+                        fill.set_width(bar.width() * progress.clamp(0.0, 1.0));
+                        ui.painter().rect_filled(fill, 3, theme::SIGNAL);
                     } else {
                         let reason = if recording { Some("Stop the recording first.".to_string()) } else { blocker.clone() };
                         let size_mb = rel.zip_size as f64 / 1_048_576.0;

@@ -641,8 +641,14 @@ impl App {
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| ui.label(RichText::new(format!("{:.0}%", self.cfg.volume * 100.0)).font(theme::mono(11.0)).color(theme::TEXT3)),
         );
-        if theme::icon_button(ui, icons::FULLSCREEN, "Fullscreen (F11 / double-click)", false).clicked() {
-            self.set_fullscreen(ui.ctx(), true);
+        let (icon, tip) = if self.fullscreen {
+            (icons::EXIT_FULLSCREEN, "Exit fullscreen (F11 / Esc / double-click)")
+        } else {
+            (icons::FULLSCREEN, "Fullscreen (F11 / double-click)")
+        };
+        if theme::icon_button(ui, icon, tip, false).clicked() {
+            let on = !self.fullscreen;
+            self.set_fullscreen(ui.ctx(), on);
         }
     }
 

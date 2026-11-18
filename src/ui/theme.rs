@@ -174,6 +174,7 @@ pub mod icons {
     icon!(SPEAKER, r#"<path d="M4 9.5h3l4.5-4v13L7 14.5H4zM15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11"/>"#);
     icon!(MUTED, r#"<path d="M4 9.5h3l4.5-4v13L7 14.5H4zM16 9.5l5 5M21 9.5l-5 5"/>"#);
     icon!(FULLSCREEN, r#"<path d="M4 9V5h4M16 5h4v4M20 15v4h-4M8 19H4v-4"/>"#);
+    icon!(EXIT_FULLSCREEN, r#"<path d="M8 4v4H4M16 4v4h4M20 16h-4v4M4 16h4v4"/>"#);
     icon!(CHECK, r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#);
     icon!(ALERT, r#"<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/>"#);
     icon!(LOCK, r#"<rect x="5.5" y="10.5" width="13" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>"#);
@@ -364,10 +365,15 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     resp
 }
 
-/// Label + switch on one row, label left, switch right.
+/// Label + switch on one row, label left (wrapping, never under the switch), switch right.
 pub fn toggle_row(ui: &mut Ui, label: &str, on: &mut bool) -> Response {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(TEXT));
+        let gap = 12.0;
+        let label_w = (ui.available_width() - 36.0 - gap).max(60.0);
+        ui.allocate_ui_with_layout(Vec2::new(label_w, 20.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(label_w);
+            ui.add(egui::Label::new(RichText::new(label).color(TEXT)).wrap());
+        });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| toggle(ui, on)).inner
     })
     .inner
@@ -449,6 +455,7 @@ mod tests {
             icons::SPEAKER,
             icons::MUTED,
             icons::FULLSCREEN,
+            icons::EXIT_FULLSCREEN,
             icons::CHECK,
             icons::ALERT,
             icons::LOCK,
