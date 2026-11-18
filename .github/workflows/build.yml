@@ -1,5 +1,5 @@
 # Build + test on every push / PR.
-# - Push to main: publishes a pre-release dev build (v<next>-dev.<run>) for the Pre-release
+# - Push to main: publishes a pre-release dev build (v<next>-dev.<commits>) for the Pre-release
 #   update channel, keeping the newest few.
 # - Push a tag like v0.2.0: publishes a release (a pre-release if the version has a suffix).
 # Releases carry the packaged zip, its SHA-256 and patch notes from the commits since the
@@ -54,7 +54,6 @@ jobs:
         id: version
         env:
           IS_MAIN: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-          RUN_NUMBER: ${{ github.run_number }}
         run: |
           $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
             Select-Object -First 1).Matches[0].Groups[1].Value
@@ -66,14 +65,16 @@ jobs:
             }
           } elseif ($env:IS_MAIN -eq 'true') {
             $kind = 'dev'
+            # N = commit count on main: rises with every commit and maps a build back to it.
+            $n = (git rev-list --count HEAD).Trim()
             # A dev build must sort above the last release and below the next one.
             if ($ver -match '-') {
-              $dev = "$ver.dev.$env:RUN_NUMBER"            # 0.2.0-beta.1 -> 0.2.0-beta.1.dev.N
+              $dev = "$ver.dev.$n"                          # 0.2.0-beta.1 -> 0.2.0-beta.1.dev.N
             } elseif (git tag -l "v$ver") {
               $p = $ver.Split('.')                          # 0.1.0 released -> 0.1.1-dev.N
-              $dev = "$($p[0]).$($p[1]).$([int]$p[2] + 1)-dev.$env:RUN_NUMBER"
+              $dev = "$($p[0]).$($p[1]).$([int]$p[2] + 1)-dev.$n"
             } else {
-              $dev = "$ver-dev.$env:RUN_NUMBER"             # 0.2.0 unreleased -> 0.2.0-dev.N
+              $dev = "$ver-dev.$n"                          # 0.2.0 unreleased -> 0.2.0-dev.N
             }
             # Stamp it into Cargo.toml so the exe reports it and build.ps1 names the zip after it.
             $toml = Get-Content Cargo.toml -Raw

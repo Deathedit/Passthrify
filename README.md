@@ -93,7 +93,7 @@ WASAPI capture ─┬─► passthrough ring ─► WASAPI render
 Settings → **Updates** checks GitHub Releases at startup (can be turned off) or on demand.
 - **Stable** offers normal releases only. **Pre-release** also offers betas, release
   candidates (tags like `v0.2.0-beta.1`) and the automatic dev builds of every push to `main`
-  (`v0.1.1-dev.42`).
+  (`v0.1.1-dev.12`).
 - **Install and restart** downloads `Passthrify-<ver>.zip` and verifies it against the release's
   `.sha256`. It then restarts into the new version, keeping your settings and any other files
   in the folder.
@@ -105,9 +105,10 @@ Settings → **Updates** checks GitHub Releases at startup (can be turned off) o
 **Cutting a release:** bump `version` in Cargo.toml, commit, then `git tag v0.2.0` and push the
 tag. A version with a suffix (`0.2.0-beta.1`) is published as a pre-release.
 
-**Dev builds:** every push to `main` publishes a pre-release `v<next>-dev.<run>`, where `<next>`
-is the Cargo.toml version, or its next patch if that version is already tagged. Only the
-newest 5 dev builds are kept.
+**Dev builds:** every push to `main` publishes a pre-release `v<next>-dev.<commits>`, where `<next>`
+is the Cargo.toml version, or its next patch if that version is already tagged, and
+`<commits>` is the commit count of `main` (`git rev-list --count HEAD`). Only the newest 5
+dev builds are kept.
 
 ## Design
 
