@@ -32,6 +32,7 @@ pub enum Command {
     ToggleRecord,
     Screenshot,
     OpenOutputFolder,
+    OpenScreenshotFolder,
     Apply(Box<Config>),
     Shutdown,
 }
@@ -435,7 +436,13 @@ impl Session {
 
     fn output_path(&self, kind: &str, ext: &str) -> PathBuf {
         let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
-        self.cfg.output_dir.join(format!("Passthrify {kind} {stamp}.{ext}"))
+        let dir = if ext == "png" { &self.cfg.screenshot_dir } else { &self.cfg.output_dir };
+        dir.join(format!("Passthrify {kind} {stamp}.{ext}"))
+    }
+
+    fn open_folder(dir: &std::path::Path) {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::process::Command::new("explorer").arg(dir).spawn();
     }
 
     fn handle(&mut self, cmd: Command) {
@@ -449,10 +456,8 @@ impl Session {
                 }
             }
             Command::Screenshot => self.screenshot(),
-            Command::OpenOutputFolder => {
-                let _ = std::fs::create_dir_all(&self.cfg.output_dir);
-                let _ = std::process::Command::new("explorer").arg(&self.cfg.output_dir).spawn();
-            }
+            Command::OpenOutputFolder => Self::open_folder(&self.cfg.output_dir),
+            Command::OpenScreenshotFolder => Self::open_folder(&self.cfg.screenshot_dir),
             Command::Apply(_) | Command::Shutdown => unreachable!("handled by control loop"),
         }
     }

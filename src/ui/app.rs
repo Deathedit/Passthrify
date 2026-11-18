@@ -432,7 +432,11 @@ impl App {
                                                 .sense(egui::Sense::click()),
                                             );
                                             if show.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                                self.pipeline.send(Command::OpenOutputFolder);
+                                                self.pipeline.send(if title.starts_with("Screenshot") {
+                                                    Command::OpenScreenshotFolder
+                                                } else {
+                                                    Command::OpenOutputFolder
+                                                });
                                             }
                                         });
                                     }
@@ -521,7 +525,8 @@ impl eframe::App for App {
             match s.show(ctx, &modes, current, actual_chroma, color, &self.hotkey_errors) {
                 SettingsOutcome::Open => {}
                 SettingsOutcome::Close => self.settings = None,
-                SettingsOutcome::OpenFolder => self.pipeline.send(Command::OpenOutputFolder),
+                SettingsOutcome::OpenFolder { screenshots: false } => self.pipeline.send(Command::OpenOutputFolder),
+                SettingsOutcome::OpenFolder { screenshots: true } => self.pipeline.send(Command::OpenScreenshotFolder),
                 SettingsOutcome::Apply(cfg) => {
                     self.settings = None;
                     self.apply_settings(*cfg);

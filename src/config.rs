@@ -130,7 +130,10 @@ pub struct Config {
     pub bitrate_mbps: u32,
     pub replay_enabled: bool,
     pub replay_seconds: u32,
+    /// Replays and recordings.
     pub output_dir: PathBuf,
+    /// Screenshots (PNG).
+    pub screenshot_dir: PathBuf,
 
     pub hotkey_save_replay: String,
     pub hotkey_toggle_record: String,
@@ -142,9 +145,16 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let output_dir = directories::UserDirs::new()
+        let user = directories::UserDirs::new();
+        let output_dir = user
+            .as_ref()
             .and_then(|d| d.video_dir().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."))
+            .join("Passthrify");
+        let screenshot_dir = user
+            .as_ref()
+            .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| output_dir.clone())
             .join("Passthrify");
         Self {
             video_device: None,
@@ -161,6 +171,7 @@ impl Default for Config {
             replay_enabled: true,
             replay_seconds: 60,
             output_dir,
+            screenshot_dir,
             hotkey_save_replay: "Alt+F10".into(),
             hotkey_toggle_record: "Alt+F9".into(),
             hotkey_screenshot: "Alt+F1".into(),
@@ -242,6 +253,15 @@ mod tests {
         let cfg: Config = toml::from_str("replay_seconds = 30").unwrap();
         assert_eq!(cfg.replay_seconds, 30);
         assert_eq!(cfg.codec, Codec::Hevc);
+    }
+
+    #[test]
+    fn screenshots_have_their_own_folder() {
+        // Older configs only had output_dir: screenshots still get the Pictures default.
+        let cfg: Config = toml::from_str(r#"output_dir = 'D:\Clips'"#).unwrap();
+        assert_eq!(cfg.output_dir, PathBuf::from(r"D:\Clips"));
+        assert_ne!(cfg.screenshot_dir, cfg.output_dir);
+        assert!(cfg.screenshot_dir.ends_with("Passthrify"));
     }
 
     #[test]

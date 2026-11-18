@@ -12,7 +12,7 @@ use crate::config::{Chroma, Codec, Config, PresentMode};
 pub enum SettingsOutcome {
     Open,
     Apply(Box<Config>),
-    OpenFolder,
+    OpenFolder { screenshots: bool },
     Close,
 }
 
@@ -180,8 +180,8 @@ impl SettingsUi {
                             Section::Capture => self.capture_card(ui, modes, current, actual_chroma, color),
                             Section::Audio => self.audio_card(ui),
                             Section::Replay => {
-                                if self.replay_card(ui, current, actual_chroma) {
-                                    outcome = SettingsOutcome::OpenFolder;
+                                if let Some(screenshots) = self.replay_card(ui, current, actual_chroma) {
+                                    outcome = SettingsOutcome::OpenFolder { screenshots };
                                 }
                             }
                             Section::Hotkeys => self.hotkeys_card(ui, hotkey_errors),
@@ -291,10 +291,10 @@ impl SettingsUi {
         });
     }
 
-    /// Returns true when "Open" (output folder) was clicked.
-    fn replay_card(&mut self, ui: &mut egui::Ui, current: Option<VideoMode>, actual: Option<Chroma>) -> bool {
+    /// Returns Some(screenshots?) when a folder's "Open" was clicked.
+    fn replay_card(&mut self, ui: &mut egui::Ui, current: Option<VideoMode>, actual: Option<Chroma>) -> Option<bool> {
         let d = &mut self.draft;
-        let mut open_folder = false;
+        let mut open_folder = None;
         theme::card(ui, "Replay and recording", |ui| {
             theme::toggle_row(ui, "Instant replay (rolling buffer in RAM)", &mut d.replay_enabled);
             ui.add_space(10.0);
@@ -368,20 +368,15 @@ impl SettingsUi {
             });
             ui.add_space(10.0);
 
-            theme::field_label(ui, "Output folder");
-            ui.horizontal(|ui| {
-                let mut dir = d.output_dir.to_string_lossy().into_owned();
-                let edit = egui::TextEdit::singleline(&mut dir)
-                    .font(theme::mono(13.0))
-                    .desired_width(ui.available_width() - 80.0)
-                    .margin(Margin::symmetric(10, 7));
-                if ui.add(edit).changed() {
-                    d.output_dir = dir.into();
-                }
-                if theme::button(ui, Kind::Secondary, Some(icons::FOLDER), "Open", None).clicked() {
-                    open_folder = true;
-                }
-            });
+            theme::field_label(ui, "Video folder (replays and recordings)");
+            if folder_row(ui, &mut d.output_dir) {
+                open_folder = Some(false);
+            }
+            ui.add_space(6.0);
+            theme::field_label(ui, "Screenshot folder");
+            if folder_row(ui, &mut d.screenshot_dir) {
+                open_folder = Some(true);
+            }
         });
         open_folder
     }
@@ -544,6 +539,22 @@ fn hotkey_string(key: egui::Key, m: egui::Modifiers) -> Option<String> {
     let s = parts.join("+");
     use std::str::FromStr;
     global_hotkey::hotkey::HotKey::from_str(&s).ok().map(|_| s)
+}
+
+/// Path text field + "Open" button. Returns true when Open was clicked.
+fn folder_row(ui: &mut egui::Ui, path: &mut std::path::PathBuf) -> bool {
+    ui.horizontal(|ui| {
+        let mut dir = path.to_string_lossy().into_owned();
+        let edit = egui::TextEdit::singleline(&mut dir)
+            .font(theme::mono(13.0))
+            .desired_width(ui.available_width() - 80.0)
+            .margin(Margin::symmetric(10, 7));
+        if ui.add(edit).changed() {
+            *path = dir.into();
+        }
+        theme::button(ui, Kind::Secondary, Some(icons::FOLDER), "Open", None).clicked()
+    })
+    .inner
 }
 
 fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {

@@ -200,6 +200,7 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
     let mut cfg = Config::load();
     if let Some(o) = out {
         cfg.output_dir = o.into();
+        cfg.screenshot_dir = cfg.output_dir.clone();
     }
     if let Some(c) = ov.chroma {
         cfg.chroma = c;
