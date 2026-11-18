@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -72,6 +73,22 @@ unsafe fn frame_thickness(h: HWND) -> (i32, i32) {
     (GetSystemMetricsForDpi(SM_CXFRAME, dpi) + pad, GetSystemMetricsForDpi(SM_CYFRAME, dpi) + pad)
 }
 
+/// Client rect for a maximized-flagged window: one that overhangs its monitor (a real
+/// maximize) is clipped to the work area; one inside the monitor (fullscreen) is left alone.
+fn maximized_client(r: RECT, monitor: RECT, work: RECT) -> RECT {
+    let overhangs =
+        r.left < monitor.left || r.top < monitor.top || r.right > monitor.right || r.bottom > monitor.bottom;
+    if !overhangs {
+        return r;
+    }
+    RECT {
+        left: r.left.max(work.left),
+        top: r.top.max(work.top),
+        right: r.right.min(work.right),
+        bottom: r.bottom.min(work.bottom),
+    }
+}
+
 /// Which part of the window a screen point is over, for WM_NCHITTEST.
 fn hit_test(x: i32, y: i32, w: i32, h: i32, grip: (i32, i32), top_grip: i32) -> u32 {
     if RESIZABLE.load(Ordering::Relaxed) {
@@ -98,16 +115,18 @@ fn hit_test(x: i32, y: i32, w: i32, h: i32, grip: (i32, i32), top_grip: i32) -> 
 unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         // Client area = the whole window. Maximized windows overhang the monitor by the frame
-        // thickness, so pull the edges back in by that much.
+        // thickness, so pull them back to the work area. A window can also be flagged maximized
+        // while fullscreen (winit keeps the flag), but then it covers the monitor exactly and
+        // must keep every pixel.
         WM_NCCALCSIZE if wp.0 != 0 => {
             if IsZoomed(h).as_bool() {
-                let (fx, fy) = frame_thickness(h);
                 let params = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
                 let r = &mut params.rgrc[0];
-                r.left += fx;
-                r.right -= fx;
-                r.top += fy;
-                r.bottom -= fy;
+                let mon = MonitorFromRect(r, MONITOR_DEFAULTTONEAREST);
+                let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                if GetMonitorInfoW(mon, &mut info).as_bool() {
+                    *r = maximized_client(*r, info.rcMonitor, info.rcWork);
+                }
             }
             return LRESULT(0);
         }
@@ -152,5 +171,16 @@ mod tests {
 
         set_layout(0, 0, false); // fullscreen: all client
         assert_eq!(hit_test(500, 1, 1000, 600, (8, 8), 4), HTCLIENT);
+    }
+
+    #[test]
+    fn maximized_vs_fullscreen_client() {
+        let rect = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let monitor = rect(0, 0, 3440, 1440);
+        let work = rect(0, 0, 3440, 1400); // taskbar at the bottom
+        // Maximized: overhangs by the frame -> clipped to the work area (taskbar stays visible).
+        assert_eq!(maximized_client(rect(-8, -8, 3448, 1408), monitor, work), work);
+        // Fullscreen while flagged maximized: exactly the monitor -> untouched.
+        assert_eq!(maximized_client(monitor, monitor, work), monitor);
     }
 }
