@@ -12,12 +12,13 @@ Rust, Media Foundation + WASAPI capture, NVENC encoding via FFmpeg, egui/wgpu UI
 | Start / stop recording | `Alt+F9` |
 | Screenshot (full-res PNG) | `Alt+F1` |
 | Fullscreen | `F11` or double-click the preview, `Esc` to leave |
+| Show / hide the sidebar | `Ctrl+B` (while Passthrify has focus) |
 
 Everything else lives in the **sidebar** on the right: Save replay, Record, Screenshot and Open
 folder at the top, quick dropdowns for **chroma**, **resolution**, **frame rate** and **codec**, then
 the settings sections, with volume and fullscreen at the bottom. The sidebar floats over the video
-and never resizes it; hide it with the panel button at its top-right, and bring it back with the
-button that appears over the video when you move the mouse. Windows under 1180 px wide start with
+and never resizes it; hide it with the panel button at its top-right (or `Ctrl+B`), and bring it
+back with the button that appears over the video when you move the mouse. Windows under 1180 px wide start with
 it hidden.
 
 | Chroma | Captured as | Encoded as | On a 4K X |

@@ -373,7 +373,7 @@ impl App {
         if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             self.open_settings(Section::Capture);
         }
-        if theme::icon_button(ui, icons::SIDEBAR_HIDE, "Hide sidebar", false).clicked() {
+        if theme::icon_button(ui, icons::SIDEBAR_HIDE, "Hide sidebar (Ctrl+B)", false).clicked() {
             self.set_sidebar(ui.ctx(), false);
         }
     }
@@ -638,7 +638,7 @@ impl App {
                     p.circle_filled(c, 5.5, theme::SURFACE);
                     p.circle_filled(c, 3.5, theme::SIGNAL);
                 }
-                let tip = if has_update { "Show sidebar (an update is available)" } else { "Show sidebar" };
+                let tip = if has_update { "Show sidebar (Ctrl+B) · an update is available" } else { "Show sidebar (Ctrl+B)" };
                 clicked = resp.on_hover_text(tip).clicked();
             });
         if clicked {
@@ -886,6 +886,15 @@ impl eframe::App for App {
                 self.set_fullscreen(ctx, on);
             } else if esc && self.fullscreen {
                 self.set_fullscreen(ctx, false);
+            }
+            // Ctrl+B shows / hides the sidebar (app-only, not a global hotkey).
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
+                let open = !self.sidebar_open;
+                if self.fullscreen {
+                    self.sidebar_open = open; // just for now; fullscreen exit restores the saved state
+                } else {
+                    self.set_sidebar(ctx, open);
+                }
             }
         }
         // Esc closes an open settings section (after fullscreen had its turn above).
