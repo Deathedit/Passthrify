@@ -48,6 +48,54 @@ const SIDEBAR_INSET: f32 = 8.0;
 const NARROW_WINDOW: f32 = 1180.0;
 /// Seconds without mouse movement before the show-sidebar button fades out.
 const SHOW_BUTTON_IDLE: f64 = 3.0;
+/// Our own title bar (the native one is removed, see `frame.rs`) and its caption buttons.
+const TITLE_BAR_H: f32 = 32.0;
+const CAPTION_BUTTON_W: f32 = 46.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum CaptionButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// One title bar button, drawn like Windows' own: thin glyph, grey hover, red hover on Close.
+fn caption_button(ui: &mut egui::Ui, rect: egui::Rect, kind: CaptionButton, maximized: bool, focused: bool) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(("caption", kind as u8)), egui::Sense::click());
+    let p = ui.painter();
+    let close = kind == CaptionButton::Close;
+    let (bg, fg) = match (close, resp.is_pointer_button_down_on(), resp.hovered()) {
+        (true, true, _) => (Color32::from_rgb(0x94, 0x1F, 0x15), Color32::WHITE),
+        (true, false, true) => (Color32::from_rgb(0xC4, 0x2B, 0x1C), Color32::WHITE),
+        (false, true, _) => (theme::PRESSED, theme::TEXT),
+        (false, false, true) => (theme::HOVER, theme::TEXT),
+        _ => (Color32::TRANSPARENT, if focused { theme::TEXT2 } else { theme::TEXT3 }),
+    };
+    p.rect_filled(rect, 0, bg);
+    let c = rect.center();
+    let s = Stroke::new(1.0_f32, fg);
+    let sq = |half: f32, at: egui::Pos2| egui::Rect::from_center_size(at, egui::Vec2::splat(half * 2.0));
+    match kind {
+        CaptionButton::Minimize => {
+            p.hline((c.x - 5.0)..=(c.x + 5.0), c.y, s);
+        }
+        CaptionButton::Maximize if maximized => {
+            // Restore: a square with another peeking out behind it.
+            let front = sq(4.0, c + egui::vec2(-1.0, 1.0));
+            p.rect_stroke(front, 0, s, egui::StrokeKind::Inside);
+            p.hline((front.left() + 2.0)..=(front.right() + 2.0), front.top() - 2.0, s);
+            p.vline(front.right() + 2.0, (front.top() - 2.0)..=(front.bottom() - 2.0), s);
+        }
+        CaptionButton::Maximize => {
+            p.rect_stroke(sq(5.0, c), 0, s, egui::StrokeKind::Inside);
+        }
+        CaptionButton::Close => {
+            p.line_segment([c + egui::vec2(-5.0, -5.0), c + egui::vec2(5.0, 5.0)], s);
+            p.line_segment([c + egui::vec2(5.0, -5.0), c + egui::vec2(-5.0, 5.0)], s);
+        }
+    }
+    resp
+}
 
 /// A row of the sidebar's settings list: icon, label, summary (or an update badge), chevron.
 fn settings_row(ui: &mut egui::Ui, section: Section, summary: &str, badge: Option<&str>) -> egui::Response {
@@ -121,6 +169,7 @@ impl App {
             _ => 0,
         };
         tray::style_title_bar(hwnd);
+        super::frame::install(hwnd);
 
         let mut hotkey_errors = Vec::new();
         let hotkeys = match Hotkeys::new(pipeline.sender()) {
@@ -649,6 +698,43 @@ impl App {
         }
     }
 
+    /// Logo + title on the left (the rest of the bar drags the window, see `frame.rs`), and
+    /// minimize / maximize / close on the right.
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.allocate_rect(rect, egui::Sense::hover());
+        let ctx = ui.ctx().clone();
+        let (focused, maximized) =
+            ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().maximized.unwrap_or(false)));
+        let p = ui.painter();
+        p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, theme::DIVIDER));
+        let cy = rect.center().y;
+        let logo = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, cy), egui::Vec2::splat(16.0));
+        let tint = if focused { Color32::WHITE } else { Color32::from_white_alpha(140) };
+        theme::mark_image(16.0).tint(tint).paint_at(ui, logo);
+        let title_color = if focused { theme::TEXT2 } else { theme::TEXT3 };
+        p.text(egui::pos2(rect.left() + 36.0, cy), egui::Align2::LEFT_CENTER, "Passthrify", FontId::new(12.0, theme::medium()), title_color);
+
+        let buttons = [CaptionButton::Close, CaptionButton::Maximize, CaptionButton::Minimize];
+        for (i, kind) in buttons.into_iter().enumerate() {
+            let right = rect.right() - CAPTION_BUTTON_W * i as f32;
+            let r = egui::Rect::from_min_max(egui::pos2(right - CAPTION_BUTTON_W, rect.top()), egui::pos2(right, rect.bottom() - 1.0));
+            let tip = match kind {
+                CaptionButton::Minimize => "Minimize",
+                CaptionButton::Maximize if maximized => "Restore down",
+                CaptionButton::Maximize => "Maximize",
+                CaptionButton::Close => "Close",
+            };
+            if caption_button(ui, r, kind, maximized, focused).on_hover_text(tip).clicked() {
+                ctx.send_viewport_cmd(match kind {
+                    CaptionButton::Minimize => egui::ViewportCommand::Minimized(true),
+                    CaptionButton::Maximize => egui::ViewportCommand::Maximized(!maximized),
+                    CaptionButton::Close => egui::ViewportCommand::Close,
+                });
+            }
+        }
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let st = &self.shared.status;
         let text = |s: String| RichText::new(s).font(theme::mono(12.0)).color(theme::TEXT2);
@@ -905,7 +991,22 @@ impl eframe::App for App {
             }
         }
 
-        if !self.fullscreen {
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if self.fullscreen {
+            super::frame::set_layout(0, 0, false);
+        } else {
+            egui::TopBottomPanel::top("title_bar")
+                .exact_height(TITLE_BAR_H)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(theme::BASE))
+                .show(ctx, |ui| self.title_bar(ui));
+            // Tell the window procedure where the drag area and the buttons are.
+            let ppp = ctx.pixels_per_point();
+            super::frame::set_layout(
+                (TITLE_BAR_H * ppp).round() as i32,
+                (3.0 * CAPTION_BUTTON_W * ppp).round() as i32,
+                !maximized,
+            );
             egui::TopBottomPanel::bottom("status")
                 .frame(
                     egui::Frame::new()
@@ -943,6 +1044,16 @@ impl eframe::App for App {
         }
 
         self.toasts(ctx);
+
+        // Our 1 px window border (the native one is gone); none when maximized or fullscreen.
+        if !self.fullscreen && !maximized {
+            ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))).rect_stroke(
+                ctx.screen_rect(),
+                0,
+                Stroke::new(1.0_f32, theme::LINE_STRONG),
+                egui::StrokeKind::Inside,
+            );
+        }
 
         // Stress test: PASSTHRIFY_CYCLE_MODES=1 applies a new capture mode every 5 s through the
         // same path as the Settings window.
