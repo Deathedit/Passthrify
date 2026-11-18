@@ -1,0 +1,121 @@
+# Build + test on every push / PR. Pushing a tag like v0.2.0 also publishes a GitHub Release
+# with the packaged zip, its SHA-256 and patch notes generated from the commits since the
+# previous tag.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create releases on tag pushes
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags for the patch notes
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # build.ps1 downloads FFmpeg 8.1 (LGPL shared) into third_party/ffmpeg when missing.
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-n8.1-lgpl-shared-${{ hashFiles('build.ps1') }}
+
+      - name: Read version
+        id: version
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$ver") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $ver - bump Cargo.toml first."
+          }
+
+      # Prerequisite checks, tests, release build, dist\Passthrify + dist\Passthrify-<ver>.zip
+      - name: Test, build and package
+        run: ./build.ps1 -Zip
+
+      - name: Checksum
+        id: checksum
+        run: |
+          $zip = "dist/Passthrify-${{ steps.version.outputs.version }}.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $zip -Leaf)" | Out-File -Encoding ascii "$zip.sha256"
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Passthrify-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: |
+            dist/Passthrify-${{ steps.version.outputs.version }}.zip
+            dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
+          if-no-files-found: error
+
+      # ---- Release (tag pushes only) ------------------------------------------------------
+
+      - name: Patch notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+          $tag = $env:GITHUB_REF_NAME
+          $prev = git describe --tags --abbrev=0 "$tag^" 2>$null
+          if ($LASTEXITCODE -ne 0) { $prev = $null } # first release: no earlier tag
+          $range = if ($prev) { "$prev..$tag" } else { $tag }
+          $since = if ($prev) { "since $prev" } else { "(first release)" }
+
+          # One bullet per commit subject; merge commits and release-bump commits are skipped.
+          $changes = git -c i18n.logOutputEncoding=utf-8 log $range --no-merges --reverse --pretty=format:'%s' |
+            Where-Object { $_ -and $_ -notmatch '^(Release|Bump version)\b' } |
+            ForEach-Object { "- $_" }
+          if (-not $changes) { $changes = @('- Maintenance release.') }
+
+          $zip = "Passthrify-${{ steps.version.outputs.version }}.zip"
+          $notes = @(
+            "## Passthrify $tag"
+            ""
+            "### Changes $since"
+            $changes
+            ""
+            "### Download"
+            "Unzip **$zip** anywhere and run ``passthrify.exe``. Needs Windows 10/11, an NVIDIA GPU"
+            "and an Elgato 4K-class capture card. Close Elgato 4K Capture Utility / OBS first."
+            ""
+            "SHA-256: ``${{ steps.checksum.outputs.sha256 }}``"
+          )
+          if ($prev) {
+            $notes += ""
+            $notes += "**Full diff:** https://github.com/$env:GITHUB_REPOSITORY/compare/$prev...$tag"
+          }
+          $notes -join "`n" | Out-File -Encoding utf8NoBOM release-notes.md
+          Get-Content release-notes.md
+          $global:LASTEXITCODE = 0 # don't let the expected `git describe` miss fail the step
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Passthrify ${{ github.ref_name }}
+          body_path: release-notes.md
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: |
+            dist/Passthrify-${{ steps.version.outputs.version }}.zip
+            dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
+          fail_on_unmatched_files: true
