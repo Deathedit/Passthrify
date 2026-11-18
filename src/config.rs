@@ -148,6 +148,9 @@ pub struct Config {
     pub check_updates: bool,
     /// `owner/name` override for the update source (official builds have one built in).
     pub update_repo: Option<String>,
+
+    /// Show the sidebar (controls + settings). Narrow windows start with it hidden anyway.
+    pub sidebar_open: bool,
 }
 
 impl Default for Config {
@@ -187,6 +190,7 @@ impl Default for Config {
             update_channel: crate::updater::UpdateChannel::Stable,
             check_updates: true,
             update_repo: None,
+            sidebar_open: true,
         }
     }
 }

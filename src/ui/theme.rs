@@ -174,13 +174,22 @@ pub mod icons {
     icon!(SPEAKER, r#"<path d="M4 9.5h3l4.5-4v13L7 14.5H4zM15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11"/>"#);
     icon!(MUTED, r#"<path d="M4 9.5h3l4.5-4v13L7 14.5H4zM16 9.5l5 5M21 9.5l-5 5"/>"#);
     icon!(FULLSCREEN, r#"<path d="M4 9V5h4M16 5h4v4M20 15v4h-4M8 19H4v-4"/>"#);
-    icon!(SETTINGS, r#"<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>"#);
     icon!(CHECK, r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#);
     icon!(ALERT, r#"<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/>"#);
     icon!(LOCK, r#"<rect x="5.5" y="10.5" width="13" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>"#);
     icon!(CLOSE, r#"<path d="M7 7l10 10M17 7L7 17"/>"#);
-    icon!(DOT, r#"<circle cx="12" cy="12" r="5" fill="white" stroke="none"/>"#);
     icon!(DOWNLOAD, r#"<path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 19h14"/>"#);
+    // Sidebar: hide (arrow into the panel edge) / show (arrow out of it).
+    icon!(SIDEBAR_HIDE, r#"<path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5zM15 5v14M9 10l2 2-2 2"/>"#);
+    icon!(SIDEBAR_SHOW, r#"<path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5zM15 5v14M11 10l-2 2 2 2"/>"#);
+    icon!(BACK, r#"<path d="M14.5 6l-6 6 6 6"/>"#);
+    icon!(CHEVRON, r#"<path d="M9.5 6l6 6-6 6"/>"#);
+    // Settings sections.
+    icon!(CAPTURE, r#"<path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h9A1.5 1.5 0 0 1 16 7.5v9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 4 16.5zM16 10.5l4-2.5v8l-4-2.5"/>"#);
+    icon!(AUDIO, r#"<path d="M4 15v-3a8 8 0 0 1 16 0v3M4 15a2 2 0 0 1 2-2h1v6H6a2 2 0 0 1-2-2zM20 15a2 2 0 0 0-2-2h-1v6h1a2 2 0 0 0 2-2z"/>"#);
+    icon!(HISTORY, r#"<path d="M4 12a8 8 0 1 0 2.34-5.66M4 4v4h4M12 9v3l2 1.5"/>"#);
+    icon!(KEYBOARD, r#"<path d="M3.5 7.5A1.5 1.5 0 0 1 5 6h14a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 19 18H5a1.5 1.5 0 0 1-1.5-1.5zM7 10h.01M10 10h.01M13 10h.01M17 10h.01M8 14h8"/>"#);
+    icon!(DISPLAY, r#"<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h15A1.5 1.5 0 0 1 21 6.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 15.5zM8 20h8M12 17v3"/>"#);
 }
 
 /// The Lens P glyph (keeps its own white + cyan colors).
@@ -262,6 +271,68 @@ pub fn button_ex(
             None => egui::Button::new(job),
         };
         ui.add(btn.corner_radius(6).min_size(Vec2::new(32.0, 32.0)))
+    })
+    .inner
+}
+
+/// A full-width button of `height`: icon and label on the left, optional mono hint on the
+/// right (the sidebar's Save replay / Record rows).
+pub fn wide_button(
+    ui: &mut Ui,
+    kind: Kind,
+    icon: (&'static str, &'static [u8]),
+    icon_tint: Option<Color32>,
+    label: &str,
+    hint: Option<&str>,
+    size: Vec2,
+) -> Response {
+    let (fill, hover, pressed, stroke, fg) = kind.colors();
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let enabled = ui.is_enabled();
+    let bg = if !enabled {
+        fill
+    } else if resp.is_pointer_button_down_on() {
+        pressed
+    } else if resp.hovered() {
+        hover
+    } else {
+        fill
+    };
+    let p = ui.painter();
+    let fade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.45) };
+    p.rect_filled(rect, 6, fade(bg));
+    let stroke = if resp.hovered() && stroke != Stroke::NONE { Stroke::new(1.0_f32, LINE_STRONG) } else { stroke };
+    if stroke != Stroke::NONE {
+        p.rect_stroke(rect, 6, stroke, egui::StrokeKind::Inside);
+    }
+    let cy = rect.center().y;
+    let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, cy), Vec2::splat(16.0));
+    icon_image(icon, 16.0, fade(icon_tint.unwrap_or(fg))).paint_at(ui, icon_rect);
+    let family = if matches!(kind, Kind::Primary | Kind::Danger) { semibold() } else { medium() };
+    p.text(egui::pos2(rect.left() + 36.0, cy), egui::Align2::LEFT_CENTER, label, FontId::new(13.0, family), fade(fg));
+    if let Some(h) = hint {
+        let c = fade(fg.gamma_multiply(0.75));
+        p.text(egui::pos2(rect.right() - 12.0, cy), egui::Align2::RIGHT_CENTER, h, FontId::new(11.5, mono_medium()), c);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Square icon-only button of `size` px in the given style.
+pub fn square_button(ui: &mut Ui, kind: Kind, icon: (&'static str, &'static [u8]), size: f32) -> Response {
+    let (fill, hover, pressed, stroke, fg) = kind.colors();
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = fill;
+        w.hovered.weak_bg_fill = hover;
+        w.active.weak_bg_fill = pressed;
+        w.inactive.bg_stroke = stroke;
+        w.hovered.bg_stroke = if stroke == Stroke::NONE { Stroke::NONE } else { Stroke::new(1.0_f32, LINE_STRONG) };
+        w.active.bg_stroke = w.hovered.bg_stroke;
+        ui.spacing_mut().button_padding = Vec2::splat((size - 16.0) / 2.0);
+        ui.add(egui::Button::image(icon_image(icon, 16.0, fg)).corner_radius(6).min_size(Vec2::splat(size)))
     })
     .inner
 }
@@ -354,22 +425,6 @@ pub fn key_chip(ui: &mut Ui, text: &str) {
         .show(ui, |ui| ui.label(RichText::new(text).font(mono(11.0)).color(TEXT)));
 }
 
-/// Settings card.
-pub fn card<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0_f32, DIVIDER))
-        .corner_radius(10)
-        .inner_margin(Margin::same(18))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).font(FontId::new(15.0, semibold())).color(TEXT));
-            ui.add_space(8.0);
-            add(ui)
-        })
-        .inner
-}
-
 /// Small status dot.
 pub fn dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
@@ -394,11 +449,19 @@ mod tests {
             icons::SPEAKER,
             icons::MUTED,
             icons::FULLSCREEN,
-            icons::SETTINGS,
             icons::CHECK,
             icons::ALERT,
             icons::LOCK,
             icons::CLOSE,
+            icons::SIDEBAR_HIDE,
+            icons::SIDEBAR_SHOW,
+            icons::BACK,
+            icons::CHEVRON,
+            icons::CAPTURE,
+            icons::AUDIO,
+            icons::HISTORY,
+            icons::KEYBOARD,
+            icons::DISPLAY,
             MARK_GLYPH,
         ] {
             let px = crate::svg_raster::rasterize(svg, 32, 32).unwrap_or_else(|e| panic!("{name}: {e}"));

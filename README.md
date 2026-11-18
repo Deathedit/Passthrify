@@ -13,7 +13,12 @@ Rust, Media Foundation + WASAPI capture, NVENC encoding via FFmpeg, egui/wgpu UI
 | Screenshot (full-res PNG) | `Alt+F1` |
 | Fullscreen | `F11` or double-click the preview, `Esc` to leave |
 
-The toolbar has quick dropdowns for **resolution**, **frame rate**, **chroma** and **codec**:
+Everything else lives in the **sidebar** on the right: Save replay, Record, Screenshot and Open
+folder at the top, quick dropdowns for **chroma**, **resolution**, **frame rate** and **codec**, then
+the settings sections, with volume and fullscreen at the bottom. The sidebar floats over the video
+and never resizes it; hide it with the panel button at its top-right, and bring it back with the
+button that appears over the video when you move the mouse. Windows under 1180 px wide start with
+it hidden.
 
 | Chroma | Captured as | Encoded as | On a 4K X |
 |---|---|---|---|
@@ -26,8 +31,8 @@ can't deliver the chosen chroma, Passthrify falls back to what it can (shown as 
 AV1 on NVENC is 4:2:0 only. 4:2:2/4:4:4 files need VLC, mpv, MPC-HC or a pro editor;
 Windows' built-in player only decodes 4:2:0.
 
-Clips go to `Videos\Passthrify` by default. Settings, hotkeys and devices are under ⚙ Settings
-and are stored in `%APPDATA%\Passthrify\config\config.toml`. The log is `passthrify.log` in the
+Clips go to `Videos\Passthrify` by default. Settings, hotkeys and devices are in the sidebar's
+settings sections and are stored in `%APPDATA%\Passthrify\config\config.toml`. The log is `passthrify.log` in the
 same folder. The tray icon offers the same actions plus show/hide.
 
 Close **Elgato 4K Capture Utility** / OBS first: the card can only be opened by one app.

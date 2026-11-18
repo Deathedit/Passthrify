@@ -30,41 +30,54 @@ pub struct App {
     updater: Arc<Updater>,
     /// Version we already announced, so the toast shows once per release.
     announced_update: Option<semver::Version>,
-    toolbar_fit: ToolbarFit,
+    /// Sidebar shown. Starts from `cfg.sidebar_open`, but narrow windows start without it and
+    /// fullscreen puts it away.
+    sidebar_open: bool,
+    /// Sidebar state to restore when leaving fullscreen.
+    sidebar_before_fullscreen: bool,
+    /// The first frame has not run yet (the window size is unknown until then).
+    first_frame: bool,
+    /// egui time until which the show-sidebar button stays visible.
+    show_button_until: f64,
 }
 
-/// Toolbar densities: 0 = full labels and hotkey hints, 1 = no hints and icon-only
-/// Screenshot / Open folder, 2 = icon-only actions and a shorter volume slider, 3 = no
-/// capture pickers, 4 = no device chip either.
-const TOOLBAR_LEVELS: usize = 5;
-/// Minimum space between the left (pickers + actions) and right (volume, settings) groups.
-const TOOLBAR_GAP: f32 = 12.0;
+/// Sidebar width, and its gap to the video area's edges.
+const SIDEBAR_W: f32 = 304.0;
+const SIDEBAR_INSET: f32 = 8.0;
+/// Windows narrower than this start with the sidebar hidden.
+const NARROW_WINDOW: f32 = 1180.0;
+/// Seconds without mouse movement before the show-sidebar button fades out.
+const SHOW_BUTTON_IDLE: f64 = 3.0;
 
-/// Measured toolbar group widths per density, so we pick the roomiest one that fits.
-/// 0.0 means "not measured yet" and is tried optimistically.
-#[derive(Default)]
-struct ToolbarFit {
-    left: [f32; TOOLBAR_LEVELS],
-    right: [f32; TOOLBAR_LEVELS],
-}
-
-impl ToolbarFit {
-    fn pick(&self, width: f32) -> usize {
-        (0..TOOLBAR_LEVELS)
-            .find(|&l| self.left[l] + self.right[l] + TOOLBAR_GAP <= width)
-            .unwrap_or(TOOLBAR_LEVELS - 1)
+/// A row of the sidebar's settings list: icon, label, summary (or an update badge), chevron.
+fn settings_row(ui: &mut egui::Ui, section: Section, summary: &str, badge: Option<&str>) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 6, theme::RAISED);
     }
-
-    /// Records what `level` actually measured. If its contents changed size (a new picker
-    /// label, the Update button appearing), the other levels' numbers are stale: forget them.
-    fn record(&mut self, level: usize, left: f32, right: f32) {
-        let changed = |old: f32, new: f32| old > 0.0 && (old - new).abs() > 0.5;
-        if changed(self.left[level], left) || changed(self.right[level], right) {
-            *self = Self::default();
-        }
-        self.left[level] = left;
-        self.right[level] = right;
+    let cy = rect.center().y;
+    let icon = egui::Rect::from_center_size(egui::pos2(rect.left() + 18.0, cy), egui::Vec2::splat(16.0));
+    theme::icon_image(section.icon(), 16.0, theme::TEXT2).paint_at(ui, icon);
+    p.text(egui::pos2(rect.left() + 36.0, cy), egui::Align2::LEFT_CENTER, section.label(), FontId::new(13.0, theme::medium()), theme::TEXT);
+    let chevron = egui::Rect::from_center_size(egui::pos2(rect.right() - 15.0, cy), egui::Vec2::splat(14.0));
+    theme::icon_image(icons::CHEVRON, 14.0, theme::TEXT3).paint_at(ui, chevron);
+    let right = rect.right() - 28.0;
+    if let Some(tag) = badge {
+        let galley = p.layout_no_wrap(tag.to_string(), theme::mono(11.0), theme::SIGNAL);
+        let r = egui::Rect::from_min_size(
+            egui::pos2(right - galley.size().x - 12.0, cy - galley.size().y / 2.0 - 2.0),
+            galley.size() + egui::vec2(12.0, 4.0),
+        );
+        p.rect_stroke(r, 4, Stroke::new(1.0_f32, theme::SIGNAL.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+        p.galley(r.min + egui::vec2(6.0, 2.0), galley, theme::SIGNAL);
+    } else if !summary.is_empty() {
+        // Keep long summaries (device names) clear of the label.
+        let label_end = rect.left() + 36.0 + 8.0 + p.layout_no_wrap(section.label().into(), FontId::new(13.0, theme::medium()), theme::TEXT).size().x;
+        let clip = egui::Rect::from_min_max(egui::pos2(label_end, rect.top()), egui::pos2(right, rect.bottom()));
+        p.with_clip_rect(clip).text(egui::pos2(right, cy), egui::Align2::RIGHT_CENTER, summary, FontId::proportional(12.0), theme::TEXT3);
     }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// "Alt+F10" -> "Alt F10", "Ctrl+Shift+KeyR" -> "Ctrl Shift R".
@@ -153,7 +166,10 @@ impl App {
             cycle_modes: std::env::var_os("PASSTHRIFY_CYCLE_MODES").is_some(),
             updater,
             announced_update: None,
-            toolbar_fit: ToolbarFit::default(),
+            sidebar_open: true,
+            sidebar_before_fullscreen: true,
+            first_frame: true,
+            show_button_until: 0.0,
         };
         // PASSTHRIFY_SETTINGS=capture|audio|replay|hotkeys|display opens Settings on launch
         // (handy for docs and screenshots).
@@ -172,132 +188,211 @@ impl App {
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        if on == self.fullscreen {
+            return;
+        }
+        // The sidebar steps aside in fullscreen and comes back afterwards.
+        if on {
+            self.sidebar_before_fullscreen = self.sidebar_open;
+            self.sidebar_open = false;
+        } else {
+            self.sidebar_open = self.sidebar_before_fullscreen;
+        }
         self.fullscreen = on;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 
+    /// Shows or hides the sidebar at the user's request (remembered in the config).
+    fn set_sidebar(&mut self, ctx: &egui::Context, open: bool) {
+        self.sidebar_open = open;
+        self.cfg.sidebar_open = open;
+        if !open {
+            // Keep the show button up for a moment so it can be found again.
+            self.show_button_until = ctx.input(|i| i.time) + SHOW_BUTTON_IDLE;
+        }
+    }
+
+    /// Opens a settings section in the sidebar (showing the sidebar if needed).
     fn open_settings(&mut self, section: Section) {
+        self.sidebar_open = true;
         match self.settings.as_mut() {
-            Some(s) => s.section = section,
-            None => {
-                let mut s = SettingsUi::new(&self.cfg);
-                s.section = section;
-                self.settings = Some(s);
+            Some(s) if s.section == section => {}
+            _ => self.settings = Some(SettingsUi::new(&self.cfg, section)),
+        }
+    }
+
+    fn handle_settings(&mut self, outcome: SettingsOutcome) {
+        match outcome {
+            SettingsOutcome::Open => {}
+            SettingsOutcome::Close => self.settings = None,
+            SettingsOutcome::OpenFolder { screenshots: false } => self.pipeline.send(Command::OpenOutputFolder),
+            SettingsOutcome::OpenFolder { screenshots: true } => self.pipeline.send(Command::OpenScreenshotFolder),
+            SettingsOutcome::Apply(cfg) => {
+                self.settings = None;
+                self.apply_settings(*cfg);
             }
         }
     }
 
-    /// Lays out the toolbar as two groups that never overlap: the right group is drawn first,
-    /// the left group gets what is left, and both get more compact until they fit.
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        use egui::{Align, Layout, Rect, UiBuilder};
+    /// The sidebar: a floating panel over the video's right edge. From the top: device chip,
+    /// pinned actions, then (scrolling) the capture pickers and the settings list, or the open
+    /// settings section; at the bottom the update notice, volume and fullscreen.
+    fn sidebar(&mut self, ctx: &egui::Context, video: egui::Rect) {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(video.right() - SIDEBAR_INSET - SIDEBAR_W, video.top() + SIDEBAR_INSET),
+            egui::pos2(video.right() - SIDEBAR_INSET, video.bottom() - SIDEBAR_INSET),
+        );
+        if rect.height() < 200.0 || rect.left() < video.left() {
+            return; // window too small to hold it
+        }
+        egui::Area::new(egui::Id::new("sidebar"))
+            .fixed_pos(rect.min)
+            .constrain(false)
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .stroke(Stroke::new(1.0_f32, theme::LINE))
+                    .corner_radius(10)
+                    .shadow(ctx.style().visuals.window_shadow)
+                    .show(ui, |ui| {
+                        ui.set_min_size(rect.size());
+                        ui.set_max_size(rect.size());
+                        let full = egui::Rect::from_min_size(ui.min_rect().min, rect.size());
+                        self.sidebar_contents(ui, full);
+                    });
+            });
+    }
+
+    fn sidebar_contents(&mut self, ui: &mut egui::Ui, full: egui::Rect) {
+        use egui::{pos2, Layout, Rect, UiBuilder};
 
         ui.spacing_mut().interact_size.y = 32.0;
         ui.spacing_mut().combo_height = 400.0;
-        let row = Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 32.0));
-        let level = self.toolbar_fit.pick(row.width());
+        let update = match self.updater.state() {
+            UpdateState::Available(rel) => Some(rel),
+            _ => None,
+        };
+        let section_open = self.settings.as_ref().map(|s| s.section);
+        let show_update_card = update.is_some() && section_open != Some(Section::Updates);
 
-        let mut right = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-        self.toolbar_right(&mut right, level);
-        let right_w = right.min_rect().width();
+        // Fixed bands, top-down and bottom-up; the middle scrolls.
+        let header = Rect::from_min_size(full.min, egui::vec2(full.width(), 56.0));
+        let actions = Rect::from_min_max(pos2(full.left(), header.bottom()), pos2(full.right(), header.bottom() + 108.0));
+        let volume = Rect::from_min_max(pos2(full.left(), full.bottom() - 48.0), full.max);
+        let mut bottom = volume.top();
+        let update_card = show_update_card.then(|| {
+            let r = Rect::from_min_max(pos2(full.left(), bottom - 62.0), pos2(full.right(), bottom));
+            bottom = r.top();
+            r
+        });
+        let section_footer = section_open.map(|_| {
+            let r = Rect::from_min_max(pos2(full.left(), bottom - 52.0), pos2(full.right(), bottom));
+            bottom = r.top();
+            r
+        });
+        let middle = Rect::from_min_max(pos2(full.left(), actions.bottom()), pos2(full.right(), bottom));
 
-        let mut left_rect = row;
-        left_rect.max.x = (row.max.x - right_w - TOOLBAR_GAP).max(row.min.x);
-        let mut left = ui.new_child(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)));
-        // Last resort when even the most compact level doesn't fit: cut off rather than overlap.
-        let mut clip = ui.clip_rect();
-        clip.max.x = clip.max.x.min(left_rect.max.x);
-        left.set_clip_rect(clip);
-        self.toolbar_left(&mut left, level);
-        let left_w = left.min_rect().width();
-
-        self.toolbar_fit.record(level, left_w, right_w);
-        if left_w + right_w + TOOLBAR_GAP > row.width() && level + 1 < TOOLBAR_LEVELS {
-            // Redo this frame at a denser level instead of showing the overlap.
-            ui.ctx().request_discard("toolbar overflow");
+        let p = ui.painter().clone();
+        let divider = |y: f32| p.hline(full.x_range(), y, Stroke::new(1.0_f32, theme::DIVIDER));
+        divider(header.bottom());
+        divider(actions.bottom());
+        divider(volume.top());
+        if let Some(r) = section_footer {
+            divider(r.top());
         }
-        ui.advance_cursor_after_rect(row);
+
+        let in_rect = |ui: &mut egui::Ui, r: Rect, layout: Layout, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.scope_builder(UiBuilder::new().max_rect(r).layout(layout), |ui| add(ui));
+        };
+
+        in_rect(ui, header.shrink2(egui::vec2(8.0, 8.0)), Layout::left_to_right(egui::Align::Center), &mut |ui| {
+            self.sidebar_header(ui)
+        });
+        in_rect(ui, actions.shrink(12.0), Layout::top_down(egui::Align::Min), &mut |ui| self.sidebar_actions(ui));
+
+        ui.scope_builder(UiBuilder::new().max_rect(middle), |ui| {
+            egui::ScrollArea::vertical().id_salt("sidebar_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                egui::Frame::new().inner_margin(Margin { left: 12, right: 12, top: 12, bottom: 14 }).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if self.settings.is_some() {
+                        self.sidebar_section(ui);
+                    } else {
+                        self.sidebar_home(ui, update.as_ref().map(|r| r.tag.as_str()));
+                    }
+                });
+            });
+        });
+
+        if let Some(r) = section_footer {
+            let mut outcome = SettingsOutcome::Open;
+            in_rect(ui, r.shrink2(egui::vec2(12.0, 10.0)), Layout::left_to_right(egui::Align::Center), &mut |ui| {
+                if let Some(s) = self.settings.as_mut() {
+                    outcome = s.footer(ui);
+                }
+            });
+            self.handle_settings(outcome);
+        }
+        if let (Some(r), Some(rel)) = (update_card, &update) {
+            let r = Rect::from_min_max(pos2(r.left() + 12.0, r.top()), pos2(r.right() - 12.0, r.bottom() - 10.0));
+            in_rect(ui, r, Layout::top_down(egui::Align::Min), &mut |ui| self.update_card(ui, rel));
+        }
+        in_rect(ui, volume.shrink2(egui::vec2(8.0, 0.0)), Layout::left_to_right(egui::Align::Center), &mut |ui| {
+            self.sidebar_volume(ui)
+        });
     }
 
-    /// Device chip, capture pickers and the recording actions.
-    fn toolbar_left(&mut self, ui: &mut egui::Ui, level: usize) {
-        let shared = self.shared.clone();
-        let st = &shared.status;
-        let device = st.device.lock().clone();
-        let mode = *st.mode.lock();
-        let modes = st.modes.lock().clone();
-        let recording_since = *st.recording_since.lock();
-        let recording = recording_since.is_some();
+    /// Device chip (status, name, mode; opens Capture settings) and the hide button.
+    fn sidebar_header(&mut self, ui: &mut egui::Ui) {
+        let st = &self.shared.status;
         let capturing = st.capturing.load(Ordering::Relaxed);
         let has_error = st.error.lock().is_some();
-        // Device chip: status dot + name; opens Settings > Capture. Dropped last when narrow.
-        if level < 4 {
-            let status = if capturing {
-                theme::SUCCESS
-            } else if has_error {
-                theme::REC
-            } else {
-                theme::TEXT3
-            };
-            let name = if device.is_empty() { "No device".to_string() } else { device };
-            let label = RichText::new(name).font(FontId::new(13.0, theme::medium())).color(theme::TEXT);
-            let chip = ui.scope(|ui| {
-                let w = &mut ui.visuals_mut().widgets;
-                w.inactive.weak_bg_fill = theme::BASE;
-                w.hovered.weak_bg_fill = theme::RAISED;
-                ui.spacing_mut().button_padding.x = 10.0;
-                let dot = theme::icon_image(icons::DOT, 12.0, status);
-                ui.add(egui::Button::image_and_text(dot, label).corner_radius(6).min_size(egui::vec2(0.0, 32.0)))
-            });
-            let tip = if capturing { "Capturing — click for capture settings" } else { "Not capturing — click for capture settings" };
-            if chip.inner.on_hover_text(tip).clicked() {
-                self.open_settings(Section::Capture);
-            }
-        }
+        let device = st.device.lock().clone();
+        let mode = *st.mode.lock();
+        let (dot, detail) = if capturing {
+            let m = mode.map(|m| format!(" · {}x{} · {:.0} Hz", m.width, m.height, m.fps())).unwrap_or_default();
+            (theme::SUCCESS, format!("Capturing{m}"))
+        } else if has_error {
+            (theme::REC, "No signal".to_string())
+        } else {
+            (theme::TEXT3, "Not capturing".to_string())
+        };
+        let name = if device.is_empty() { "No device".to_string() } else { device };
 
-        // Chroma -> resolution -> frame rate -> codec. Applied immediately. When narrow these
-        // give way to the actions (they are also in Settings > Capture).
-        if level < 3 {
-            let mut pref = self.cfg.video_mode;
-            let mut codec = self.cfg.codec;
-            let mut chroma = self.cfg.chroma;
-            let actual_chroma = *st.chroma.lock();
-            let changed = ui
-                .add_enabled_ui(!recording, |ui| {
-                    let mut c = pickers::chroma_picker(
-                        ui, "toolbar", &mut chroma, &mut pref, &mut codec, &modes, actual_chroma, 64.0,
-                    );
-                    c |= pickers::resolution_picker(ui, "toolbar", &mut pref, chroma, &modes, mode, 116.0);
-                    c |= pickers::rate_picker(ui, "toolbar", &mut pref, chroma, &modes, mode, 86.0);
-                    c |= pickers::codec_picker(ui, "toolbar", &mut codec, chroma, true, 60.0);
-                    c
-                })
-                .inner;
-            if recording {
-                ui.add(theme::icon_image(icons::LOCK, 14.0, theme::TEXT3))
-                    .on_hover_text("Stop recording to change chroma, resolution, frame rate or codec");
-            }
-            if changed {
-                let mut c = self.cfg.clone();
-                c.video_mode = pref;
-                c.codec = codec;
-                c.chroma = chroma;
-                self.apply_settings(c);
-                if let Some(s) = self.settings.as_mut() {
-                    s.sync_capture(&self.cfg);
-                }
-            }
-            ui.add_space(if level >= 2 { 4.0 } else { 8.0 });
+        let chip_w = ui.available_width() - 32.0 - ui.spacing().item_spacing.x;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(chip_w, 40.0), egui::Sense::click());
+        let p = ui.painter().with_clip_rect(rect);
+        if resp.hovered() {
+            p.rect_filled(rect, 6, theme::RAISED);
         }
+        p.circle_filled(egui::pos2(rect.left() + 14.0, rect.center().y), 4.0, dot);
+        let x = rect.left() + 28.0;
+        p.text(egui::pos2(x, rect.center().y - 8.0), egui::Align2::LEFT_CENTER, name, FontId::new(13.0, theme::medium()), theme::TEXT);
+        p.text(egui::pos2(x, rect.center().y + 9.0), egui::Align2::LEFT_CENTER, detail, theme::mono(11.0), theme::TEXT3);
+        let tip = if capturing { "Capturing — click for capture settings" } else { "Not capturing — click for capture settings" };
+        if resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.open_settings(Section::Capture);
+        }
+        if theme::icon_button(ui, icons::SIDEBAR_HIDE, "Hide sidebar", false).clicked() {
+            self.set_sidebar(ui.ctx(), false);
+        }
+    }
 
-        // Actions.
+    /// Save replay, Record / Stop, Screenshot, Open folder: pinned, never scroll away.
+    fn sidebar_actions(&mut self, ui: &mut egui::Ui) {
+        let recording_since = *self.shared.status.recording_since.lock();
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+        let w = ui.available_width();
+
         let save_hint = pretty_hotkey(&self.cfg.hotkey_save_replay);
-        let save = theme::button(
+        let save = theme::wide_button(
             ui,
             Kind::Primary,
-            Some(icons::REPLAY),
-            if level >= 2 { "" } else { "Save replay" },
-            (level == 0 && !save_hint.is_empty()).then_some(save_hint.as_str()),
+            icons::REPLAY,
+            None,
+            "Save replay",
+            (!save_hint.is_empty()).then_some(save_hint.as_str()),
+            egui::vec2(w, 40.0),
         );
         let mut save_tip = format!("Save replay: the last {} s", self.cfg.replay_seconds);
         if !save_hint.is_empty() {
@@ -307,74 +402,250 @@ impl App {
             self.pipeline.send(Command::SaveReplay);
         }
 
-        let rec_tip = format!("Start / stop recording ({})", pretty_hotkey(&self.cfg.hotkey_toggle_record));
-        let rec = match recording_since {
-            Some(since) => {
-                let clock = theme::fmt_clock(since.elapsed().as_secs());
-                theme::button(ui, Kind::Danger, Some(icons::STOP), if level >= 2 { "" } else { "Stop" }, Some(&clock))
+        ui.horizontal(|ui| {
+            let rec_hint = pretty_hotkey(&self.cfg.hotkey_toggle_record);
+            let rec_w = w - 2.0 * (36.0 + 8.0);
+            let size = egui::vec2(rec_w, 36.0);
+            let rec = match recording_since {
+                Some(since) => {
+                    let clock = theme::fmt_clock(since.elapsed().as_secs());
+                    theme::wide_button(ui, Kind::Danger, icons::STOP, None, "Stop", Some(&clock), size)
+                }
+                None => {
+                    let hint = (!rec_hint.is_empty()).then_some(rec_hint.as_str());
+                    theme::wide_button(ui, Kind::Secondary, icons::RECORD, Some(theme::REC), "Record", hint, size)
+                }
+            };
+            if rec.on_hover_text(format!("Start / stop recording ({rec_hint})")).clicked() {
+                self.pipeline.send(Command::ToggleRecord);
             }
-            None => {
-                let label = if level >= 2 { "" } else { "Record" };
-                theme::button_ex(ui, Kind::Secondary, Some(icons::RECORD), Some(theme::REC), label, None)
+            let shot_tip = format!("Screenshot ({})", pretty_hotkey(&self.cfg.hotkey_screenshot));
+            if theme::square_button(ui, Kind::Secondary, icons::CAMERA, 36.0).on_hover_text(shot_tip).clicked() {
+                self.pipeline.send(Command::Screenshot);
             }
+            let folder_tip = format!("Open video folder ({})", self.cfg.output_dir.display());
+            if theme::square_button(ui, Kind::Ghost, icons::FOLDER, 36.0).on_hover_text(folder_tip).clicked() {
+                self.pipeline.send(Command::OpenOutputFolder);
+            }
+        });
+    }
+
+    /// Capture pickers (2x2, applied immediately) and the settings list.
+    fn sidebar_home(&mut self, ui: &mut egui::Ui, update_tag: Option<&str>) {
+        let shared = self.shared.clone();
+        let st = &shared.status;
+        let mode = *st.mode.lock();
+        let modes = st.modes.lock().clone();
+        let recording = st.recording_since.lock().is_some();
+        let actual_chroma = *st.chroma.lock();
+
+        ui.horizontal(|ui| {
+            theme::field_label(ui, "Capture");
+            if recording {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("Locked while recording").size(11.0).color(theme::TEXT3));
+                    ui.add(theme::icon_image(icons::LOCK, 13.0, theme::TEXT3));
+                });
+            }
+        });
+        ui.add_space(2.0);
+
+        let mut pref = self.cfg.video_mode;
+        let mut codec = self.cfg.codec;
+        let mut chroma = self.cfg.chroma;
+        let small = |ui: &mut egui::Ui, text: &str| {
+            ui.label(RichText::new(text.to_uppercase()).font(FontId::new(10.5, theme::semibold())).color(theme::TEXT3));
         };
-        if rec.on_hover_text(rec_tip).clicked() {
-            self.pipeline.send(Command::ToggleRecord);
+        let changed = ui
+            .add_enabled_ui(!recording, |ui| {
+                let mut c = false;
+                ui.columns(2, |cols| {
+                    small(&mut cols[0], "Chroma");
+                    let w = cols[0].available_width();
+                    c |= pickers::chroma_picker(&mut cols[0], "sidebar", &mut chroma, &mut pref, &mut codec, &modes, actual_chroma, w);
+                    small(&mut cols[1], "Resolution");
+                    let w = cols[1].available_width();
+                    c |= pickers::resolution_picker(&mut cols[1], "sidebar", &mut pref, chroma, &modes, mode, w);
+                });
+                ui.add_space(4.0);
+                ui.columns(2, |cols| {
+                    small(&mut cols[0], "Frame rate");
+                    let w = cols[0].available_width();
+                    c |= pickers::rate_picker(&mut cols[0], "sidebar", &mut pref, chroma, &modes, mode, w);
+                    small(&mut cols[1], "Codec");
+                    let w = cols[1].available_width();
+                    c |= pickers::codec_picker(&mut cols[1], "sidebar", &mut codec, chroma, true, w);
+                });
+                c
+            })
+            .inner;
+        if recording {
+            ui.label(
+                RichText::new("Stop recording to change chroma, resolution, frame rate or codec.").size(12.0).color(theme::TEXT3),
+            );
+        }
+        if changed {
+            let mut c = self.cfg.clone();
+            c.video_mode = pref;
+            c.codec = codec;
+            c.chroma = chroma;
+            self.apply_settings(c);
         }
 
-        let shot_tip = format!("Screenshot ({})", pretty_hotkey(&self.cfg.hotkey_screenshot));
-        let shot = theme::button(ui, Kind::Secondary, Some(icons::CAMERA), if level >= 1 { "" } else { "Screenshot" }, None);
-        if shot.on_hover_text(shot_tip).clicked() {
-            self.pipeline.send(Command::Screenshot);
-        }
-        let folder = theme::button(ui, Kind::Ghost, Some(icons::FOLDER), if level >= 1 { "" } else { "Open folder" }, None);
-        if folder.on_hover_text(self.cfg.output_dir.display().to_string()).clicked() {
-            self.pipeline.send(Command::OpenOutputFolder);
+        ui.add_space(10.0);
+        let y = ui.cursor().top();
+        ui.painter().hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, theme::DIVIDER));
+        ui.add_space(12.0);
+
+        theme::field_label(ui, "Settings");
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for s in Section::ALL {
+            let summary = if s == Section::Updates && update_tag.is_some() { String::new() } else { s.summary(&self.cfg) };
+            let badge = if s == Section::Updates { update_tag } else { None };
+            if settings_row(ui, s, &summary, badge).clicked() {
+                self.open_settings(s);
+            }
         }
     }
 
-    /// Right side, laid out right-to-left: settings, update, fullscreen, volume, mute.
-    fn toolbar_right(&mut self, ui: &mut egui::Ui, level: usize) {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        if theme::icon_button(ui, icons::SETTINGS, "Settings", self.settings.is_some()).clicked() {
-            if self.settings.is_some() {
-                self.settings = None;
-            } else {
-                self.open_settings(Section::Capture);
-            }
+    /// An open settings section: back arrow + title, then its fields.
+    fn sidebar_section(&mut self, ui: &mut egui::Ui) {
+        let Some(mut s) = self.settings.take() else { return };
+        let mut back = false;
+        ui.horizontal(|ui| {
+            back = theme::icon_button(ui, icons::BACK, "Back to settings (Esc)", false).clicked();
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(RichText::new("Settings").size(11.0).color(theme::TEXT3));
+                ui.label(RichText::new(s.section.label()).font(FontId::new(15.0, theme::semibold())).color(theme::TEXT));
+            });
+        });
+        ui.add_space(10.0);
+
+        let st = &self.shared.status;
+        let modes = st.modes.lock().clone();
+        let current = *st.mode.lock();
+        let actual_chroma = *st.chroma.lock();
+        let color = *st.color.lock();
+        let recording = st.recording_since.lock().is_some();
+        let outcome = s.body(ui, &modes, current, actual_chroma, color, &self.hotkey_errors, &self.updater, recording);
+        self.settings = Some(s);
+        self.handle_settings(if back { SettingsOutcome::Close } else { outcome });
+    }
+
+    /// "Update vX · channel · View" card above the volume row.
+    fn update_card(&mut self, ui: &mut egui::Ui, rel: &updater::Release) {
+        let mut view = false;
+        egui::Frame::new()
+            .fill(theme::BASE)
+            .stroke(Stroke::new(1.0_f32, theme::SIGNAL.gamma_multiply(0.35)))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add(theme::icon_image(icons::DOWNLOAD, 16.0, theme::SIGNAL));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(RichText::new(format!("Update {}", rel.tag)).font(FontId::new(12.0, theme::semibold())).color(theme::TEXT));
+                        let kind = if rel.prerelease { "Pre-release" } else { "Stable" };
+                        ui.label(RichText::new(kind).font(theme::mono(11.0)).color(theme::TEXT3));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let link = ui.add(
+                            egui::Label::new(RichText::new("View").font(FontId::new(12.0, theme::semibold())).color(theme::SIGNAL))
+                                .sense(egui::Sense::click()),
+                        );
+                        view = link.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                    });
+                });
+            });
+        if view {
+            self.open_settings(Section::Updates);
         }
-        if let UpdateState::Available(rel) = self.updater.state() {
-            let label = if level >= 2 { String::new() } else { format!("Update {}", rel.tag) };
-            let resp = theme::button_ex(ui, Kind::Secondary, Some(icons::DOWNLOAD), Some(theme::SIGNAL), &label, None);
-            let tip = format!("{} is available — open Settings › Updates", rel.tag);
-            if resp.on_hover_text(tip).clicked() {
-                self.open_settings(Section::Updates);
-            }
+    }
+
+    /// Mute, volume slider + percentage, fullscreen.
+    fn sidebar_volume(&mut self, ui: &mut egui::Ui) {
+        let muted = self.cfg.muted || self.cfg.volume == 0.0;
+        let icon = if muted { icons::MUTED } else { icons::SPEAKER };
+        let tip = if self.cfg.muted { "Unmute passthrough" } else { "Mute passthrough" };
+        if theme::icon_button(ui, icon, tip, false).clicked() {
+            self.cfg.muted = !self.cfg.muted;
+            self.shared.ring.set_muted(self.cfg.muted);
         }
-        if theme::icon_button(ui, icons::FULLSCREEN, "Fullscreen (F11 / double-click)", false).clicked() {
-            let on = !self.fullscreen;
-            self.set_fullscreen(ui.ctx(), on);
-        }
-        ui.add_space(4.0);
-        // Compact slider: knob size follows interact height, so shrink it here.
+        let slider_w = ui.available_width() - 38.0 - 32.0 - 2.0 * ui.spacing().item_spacing.x;
         let resp = ui
             .scope(|ui| {
-                ui.spacing_mut().slider_width = if level >= 2 { 64.0 } else { 96.0 };
+                // Compact slider: knob size follows interact height, so shrink it here.
+                ui.spacing_mut().slider_width = slider_w.max(40.0);
                 ui.spacing_mut().interact_size.y = 16.0;
                 ui.add(egui::Slider::new(&mut self.cfg.volume, 0.0..=2.0).show_value(false))
             })
             .inner
-            .on_hover_text(format!("Passthrough volume {:.0}%", self.cfg.volume * 100.0));
+            .on_hover_text("Passthrough volume");
         if resp.changed() {
             self.shared.ring.set_volume(self.cfg.volume);
         }
-        let muted = self.cfg.muted || self.cfg.volume == 0.0;
-        let icon = if muted { icons::MUTED } else { icons::SPEAKER };
-        if theme::icon_button(ui, icon, if self.cfg.muted { "Unmute passthrough" } else { "Mute passthrough" }, false)
-            .clicked()
-        {
-            self.cfg.muted = !self.cfg.muted;
-            self.shared.ring.set_muted(self.cfg.muted);
+        ui.allocate_ui_with_layout(
+            egui::vec2(38.0, 32.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| ui.label(RichText::new(format!("{:.0}%", self.cfg.volume * 100.0)).font(theme::mono(11.0)).color(theme::TEXT3)),
+        );
+        if theme::icon_button(ui, icons::FULLSCREEN, "Fullscreen (F11 / double-click)", false).clicked() {
+            self.set_fullscreen(ui.ctx(), true);
+        }
+    }
+
+    /// With the sidebar hidden: a small button over the video's top-right corner brings it
+    /// back. It fades out after a few seconds without mouse movement over the video.
+    fn show_sidebar_button(&mut self, ctx: &egui::Context, video: egui::Rect) {
+        let now = ctx.input(|i| i.time);
+        let rect = egui::Rect::from_min_size(egui::pos2(video.right() - 12.0 - 36.0, video.top() + 12.0), egui::Vec2::splat(36.0));
+        let (moved, hovered) = ctx.input(|i| {
+            let pos = i.pointer.hover_pos();
+            (i.pointer.delta() != egui::Vec2::ZERO && pos.is_some_and(|p| video.contains(p)), pos.is_some_and(|p| rect.contains(p)))
+        });
+        if moved {
+            self.show_button_until = now + SHOW_BUTTON_IDLE;
+        }
+        let visible = hovered || now < self.show_button_until;
+        let t = ctx.animate_bool_with_time(egui::Id::new("show_sidebar_fade"), visible, 0.4);
+        if t <= 0.0 {
+            return;
+        }
+        let has_update = matches!(self.updater.state(), UpdateState::Available(_));
+        let mut clicked = false;
+        egui::Area::new(egui::Id::new("show_sidebar"))
+            .fixed_pos(rect.min)
+            .constrain(false)
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                let (r, resp) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
+                let p = ui.painter();
+                let (bg, fg) = if resp.hovered() {
+                    (theme::HOVER, theme::TEXT)
+                } else {
+                    (Color32::from_rgba_unmultiplied(19, 22, 27, 199), theme::TEXT2)
+                };
+                p.rect_filled(r, 8, bg);
+                p.rect_stroke(r, 8, Stroke::new(1.0_f32, theme::LINE_STRONG), egui::StrokeKind::Inside);
+                let icon = egui::Rect::from_center_size(r.center(), egui::Vec2::splat(16.0));
+                theme::icon_image(icons::SIDEBAR_SHOW, 16.0, fg).paint_at(ui, icon);
+                if has_update {
+                    let c = egui::pos2(r.right() - 8.5, r.top() + 8.5);
+                    p.circle_filled(c, 5.5, theme::SURFACE);
+                    p.circle_filled(c, 3.5, theme::SIGNAL);
+                }
+                let tip = if has_update { "Show sidebar (an update is available)" } else { "Show sidebar" };
+                clicked = resp.on_hover_text(tip).clicked();
+            });
+        if clicked {
+            self.set_sidebar(ctx, true);
+        }
+        if visible {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -496,8 +767,10 @@ impl App {
             return;
         }
         let bottom = if self.fullscreen { -20.0 } else { -48.0 };
+        // Stay clear of the sidebar while it is open.
+        let right = if self.sidebar_open { -(SIDEBAR_W + SIDEBAR_INSET + 16.0) } else { -20.0 };
         egui::Area::new(egui::Id::new("toasts"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-20.0, bottom])
+            .anchor(egui::Align2::RIGHT_BOTTOM, [right, bottom])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 for (text, error, age) in toasts {
@@ -570,12 +843,18 @@ impl App {
                 c.hotkey_screenshot.clear();
                 c.present_mode = crate::config::PresentMode::Mailbox;
                 c.windows_notifications = false;
+                c.sidebar_open = false;
             }
             a != b
         };
         let mut cfg = new_cfg;
+        // Live UI state, not part of a settings draft.
         cfg.volume = self.cfg.volume;
         cfg.muted = self.cfg.muted;
+        cfg.sidebar_open = self.cfg.sidebar_open;
+        if let Some(s) = self.settings.as_mut() {
+            s.sync_capture(&cfg);
+        }
         self.cfg = cfg;
         self.cfg.save();
         self.shared.windows_notifications.store(self.cfg.windows_notifications, Ordering::Relaxed);
@@ -590,6 +869,15 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.first_frame {
+            self.first_frame = false;
+            // Narrow windows start with the sidebar hidden (unless settings were asked for).
+            let wide = ctx.screen_rect().width() >= NARROW_WINDOW;
+            if self.settings.is_none() {
+                self.sidebar_open = self.cfg.sidebar_open && wide;
+            }
+        }
+
         let capturing_hotkey = self.settings.as_ref().is_some_and(|s| s.is_capturing_hotkey());
         let (f11, esc) = ctx.input(|i| (i.key_pressed(egui::Key::F11), i.key_pressed(egui::Key::Escape)));
         if !capturing_hotkey {
@@ -600,16 +888,15 @@ impl eframe::App for App {
                 self.set_fullscreen(ctx, false);
             }
         }
+        // Esc closes an open settings section (after fullscreen had its turn above).
+        if self.sidebar_open && !(esc && self.fullscreen) {
+            if let Some(s) = self.settings.as_mut() {
+                let outcome = s.poll(ctx);
+                self.handle_settings(outcome);
+            }
+        }
 
         if !self.fullscreen {
-            egui::TopBottomPanel::top("toolbar")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::SURFACE)
-                        .inner_margin(Margin::symmetric(12, 8))
-                        .stroke(Stroke::new(1.0_f32, theme::DIVIDER)),
-                )
-                .show(ctx, |ui| self.toolbar(ui));
             egui::TopBottomPanel::bottom("status")
                 .frame(
                     egui::Frame::new()
@@ -619,9 +906,18 @@ impl eframe::App for App {
                 )
                 .show(ctx, |ui| self.status_bar(ui));
         }
-        egui::CentralPanel::default()
+        let video = egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::VOID))
-            .show(ctx, |ui| self.preview(ui));
+            .show(ctx, |ui| self.preview(ui))
+            .response
+            .rect;
+
+        // The sidebar floats over the video, so showing or hiding it never moves the picture.
+        if self.sidebar_open {
+            self.sidebar(ctx, video);
+        } else {
+            self.show_sidebar_button(ctx, video);
+        }
 
         // Updates: announce a new release once; close when the installer has taken over.
         match self.updater.state() {
@@ -638,24 +934,6 @@ impl eframe::App for App {
         }
 
         self.toasts(ctx);
-
-        if let Some(s) = self.settings.as_mut() {
-            let modes = self.shared.status.modes.lock().clone();
-            let current = *self.shared.status.mode.lock();
-            let actual_chroma = *self.shared.status.chroma.lock();
-            let color = *self.shared.status.color.lock();
-            let recording = self.shared.status.recording_since.lock().is_some();
-            match s.show(ctx, &modes, current, actual_chroma, color, &self.hotkey_errors, &self.updater, recording) {
-                SettingsOutcome::Open => {}
-                SettingsOutcome::Close => self.settings = None,
-                SettingsOutcome::OpenFolder { screenshots: false } => self.pipeline.send(Command::OpenOutputFolder),
-                SettingsOutcome::OpenFolder { screenshots: true } => self.pipeline.send(Command::OpenScreenshotFolder),
-                SettingsOutcome::Apply(cfg) => {
-                    self.settings = None;
-                    self.apply_settings(*cfg);
-                }
-            }
-        }
 
         // Stress test: PASSTHRIFY_CYCLE_MODES=1 applies a new capture mode every 5 s through the
         // same path as the Settings window.
