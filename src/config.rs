@@ -37,6 +37,58 @@ impl Codec {
     }
 }
 
+/// Chroma subsampling kept through capture, preview and encoding.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Chroma {
+    /// 4:2:0: most compatible, every mode. (NV12)
+    #[default]
+    #[serde(rename = "4:2:0")]
+    S420,
+    /// 4:2:2: full vertical chroma. (YUY2 capture, NV16 encode)
+    #[serde(rename = "4:2:2")]
+    S422,
+    /// 4:4:4: full-resolution color, sharpest text/UI. (RGB24 capture, YUV444 encode)
+    #[serde(rename = "4:4:4")]
+    S444,
+}
+
+impl Chroma {
+    pub const ALL: [Chroma; 3] = [Chroma::S420, Chroma::S422, Chroma::S444];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Chroma::S420 => "4:2:0",
+            Chroma::S422 => "4:2:2",
+            Chroma::S444 => "4:4:4",
+        }
+    }
+
+    /// Horizontal / vertical chroma subsampling divisors.
+    pub fn subsampling(self) -> (u32, u32) {
+        match self {
+            Chroma::S420 => (2, 2),
+            Chroma::S422 => (2, 1),
+            Chroma::S444 => (1, 1),
+        }
+    }
+
+    /// Relative bitrate needed for similar quality.
+    fn bitrate_factor(self) -> f64 {
+        match self {
+            Chroma::S420 => 1.0,
+            Chroma::S422 => 1.3,
+            Chroma::S444 => 1.6,
+        }
+    }
+}
+
+impl Codec {
+    /// NVENC can't encode AV1 at 4:2:2 / 4:4:4.
+    pub fn supports(self, chroma: Chroma) -> bool {
+        chroma == Chroma::S420 || self != Codec::Av1
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentMode {
     /// Low latency, no tearing (default).
@@ -61,6 +113,8 @@ pub struct Config {
     pub video_device: Option<String>,
     /// Preferred capture mode; None = best available (up to 4K, highest fps, NV12 preferred).
     pub video_mode: Option<ModePref>,
+    /// Desired chroma subsampling; falls back to what the chosen mode can deliver.
+    pub chroma: Chroma,
     /// Audio capture endpoint name substring; None = auto-match the capture card.
     pub audio_input: Option<String>,
     /// Audio render endpoint for passthrough; None = Windows default output.
@@ -93,6 +147,7 @@ impl Default for Config {
         Self {
             video_device: None,
             video_mode: None,
+            chroma: Chroma::S420,
             audio_input: None,
             audio_output: None,
             passthrough_enabled: true,
@@ -152,16 +207,16 @@ impl Config {
         }
     }
 
-    /// Bitrate in bits/s for the given capture mode.
-    pub fn bitrate_bps(&self, width: u32, height: u32, fps: f64) -> u64 {
+    /// Bitrate in bits/s for the given capture mode and the chroma actually captured.
+    pub fn bitrate_bps(&self, width: u32, height: u32, fps: f64, chroma: Chroma) -> u64 {
         if self.bitrate_mbps > 0 {
             return self.bitrate_mbps as u64 * 1_000_000;
         }
-        // ~0.1 bits/pixel for HEVC/AV1 (4K60 ≈ 50 Mbps), 1.5x for H.264.
+        // ~0.1 bits/pixel for HEVC/AV1 (4K60 4:2:0 ≈ 50 Mbps), 1.5x for H.264, more for 4:2:2/4:4:4.
         let bpp = match self.codec {
             Codec::H264 => 0.15,
             _ => 0.10,
-        };
+        } * chroma.bitrate_factor();
         let bps = width as f64 * height as f64 * fps.max(1.0) * bpp;
         (bps as u64).clamp(12_000_000, 150_000_000)
     }
@@ -189,8 +244,19 @@ mod tests {
     #[test]
     fn auto_bitrate() {
         let cfg = Config::default();
-        let b = cfg.bitrate_bps(3840, 2160, 60.0);
+        let b = cfg.bitrate_bps(3840, 2160, 60.0, Chroma::S420);
         assert!((45_000_000..=55_000_000).contains(&b), "{b}");
-        assert_eq!(cfg.bitrate_bps(1280, 720, 30.0), 12_000_000);
+        assert_eq!(cfg.bitrate_bps(1280, 720, 30.0, Chroma::S420), 12_000_000);
+        assert!(cfg.bitrate_bps(2560, 1440, 60.0, Chroma::S444) > cfg.bitrate_bps(2560, 1440, 60.0, Chroma::S420));
+    }
+
+    #[test]
+    fn chroma_serializes_readably() {
+        let mut cfg = Config::default();
+        cfg.chroma = Chroma::S444;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("chroma = \"4:4:4\""), "{text}");
+        assert!(!Codec::Av1.supports(Chroma::S444));
+        assert!(Codec::Hevc.supports(Chroma::S422));
     }
 }

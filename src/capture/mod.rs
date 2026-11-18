@@ -7,21 +7,41 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
-/// A decoded frame in NV12 with tightly packed rows (stride == width):
-/// Y plane (`width * height` bytes) followed by interleaved UV (`width * height / 2` bytes).
+pub use crate::config::Chroma;
+
+/// A frame with tightly packed rows: a Y plane (`width * height` bytes) followed by one
+/// interleaved UV plane at chroma resolution (`chroma_size()`, 2 bytes per sample).
+/// That is NV12 for 4:2:0, NV16 for 4:2:2 and NV24 for 4:4:4.
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
+    pub chroma: Chroma,
     pub data: PooledBuf,
     /// Arrival time on the session clock.
     pub pts_us: i64,
     pub seq: u64,
 }
 
+/// Chroma plane dimensions for a frame size.
+pub fn chroma_size(width: u32, height: u32, chroma: Chroma) -> (u32, u32) {
+    let (sx, sy) = chroma.subsampling();
+    (width / sx, height / sy)
+}
+
+/// Total bytes of a packed frame (Y + interleaved UV).
+pub fn frame_len(width: u32, height: u32, chroma: Chroma) -> usize {
+    let (cw, ch) = chroma_size(width, height, chroma);
+    (width * height + cw * ch * 2) as usize
+}
+
 impl VideoFrame {
+    pub fn chroma_size(&self) -> (u32, u32) {
+        chroma_size(self.width, self.height, self.chroma)
+    }
     pub fn y_plane(&self) -> &[u8] {
         &self.data[..(self.width * self.height) as usize]
     }
+    /// Interleaved UV; each row is `chroma_size().0 * 2` bytes.
     pub fn uv_plane(&self) -> &[u8] {
         &self.data[(self.width * self.height) as usize..]
     }

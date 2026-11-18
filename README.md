@@ -13,6 +13,19 @@ Rust, Media Foundation + WASAPI capture, NVENC encoding via FFmpeg, egui/wgpu UI
 | Screenshot (full-res PNG) | `Alt+F1` |
 | Fullscreen | `F11` or double-click the preview, `Esc` to leave |
 
+The toolbar has quick dropdowns for **resolution**, **frame rate**, **chroma** and **codec**:
+
+| Chroma | Captured as | Encoded as | On a 4K X |
+|---|---|---|---|
+| 4:2:0 | NV12 | HEVC Main / H.264 High / AV1 | every mode, up to 4K144 |
+| 4:2:2 | YUY2 | HEVC Rext / H.264 High 4:2:2 (RTX 50-series) | up to 4K30, 1440p60, 1080p144 |
+| 4:4:4 | RGB24 | HEVC Rext / H.264 High 4:4:4 | up to 1440p60, 1080p120 |
+
+Resolution and frame-rate lists are tagged with the best chroma each mode offers. If a mode
+can't deliver the chosen chroma, Passthrify falls back to what it can (shown as `4:4:4 → 4:2:0`).
+AV1 on NVENC is 4:2:0 only. 4:2:2/4:4:4 files need VLC, mpv, MPC-HC or a pro editor;
+Windows' built-in player only decodes 4:2:0.
+
 Clips go to `Videos\Passthrify` by default. Settings, hotkeys and devices are under ⚙ Settings
 and are stored in `%APPDATA%\Passthrify\config\config.toml`. The log is `passthrify.log` in the
 same folder. The tray icon offers the same actions plus show/hide.

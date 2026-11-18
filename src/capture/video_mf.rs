@@ -9,7 +9,7 @@ use windows::core::{GUID, PWSTR};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 
-use super::{looks_like_elgato, FramePool, VideoFrame};
+use super::{looks_like_elgato, Chroma, FramePool, VideoFrame};
 use crate::clock;
 use crate::config::ModePref;
 
@@ -37,9 +37,12 @@ impl Drop for MfGuard {
 pub enum PixFmt {
     Nv12,
     Yuy2,
+    /// Packed B,G,R bytes (MFVideoFormat_RGB24), usually bottom-up. Full 4:4:4 color.
+    Rgb24,
     P010,
     Mjpg,
-    Other,
+    /// Unhandled subtype; holds GUID.Data1 (the FourCC / D3DFORMAT for MF video subtypes).
+    Other(u32),
 }
 
 impl PixFmt {
@@ -48,27 +51,63 @@ impl PixFmt {
             PixFmt::Nv12
         } else if *g == MFVideoFormat_YUY2 {
             PixFmt::Yuy2
+        } else if *g == MFVideoFormat_RGB24 {
+            PixFmt::Rgb24
         } else if *g == MFVideoFormat_P010 {
             PixFmt::P010
         } else if *g == MFVideoFormat_MJPG {
             PixFmt::Mjpg
         } else {
-            PixFmt::Other
+            PixFmt::Other(g.data1)
+        }
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            PixFmt::Other(code) => {
+                let b = code.to_le_bytes();
+                if b.iter().all(|c| c.is_ascii_graphic() || *c == b' ') {
+                    String::from_utf8_lossy(&b).trim().to_string()
+                } else {
+                    format!("D3DFMT {code}")
+                }
+            }
+            f => format!("{f:?}").to_uppercase(),
         }
     }
 
     pub fn supported(self) -> bool {
-        matches!(self, PixFmt::Nv12 | PixFmt::Yuy2)
+        matches!(self, PixFmt::Nv12 | PixFmt::Yuy2 | PixFmt::Rgb24)
     }
 
-    /// Lower is better.
-    fn rank(self) -> u32 {
+    /// Chroma resolution the device delivers in this format.
+    pub fn native_chroma(self) -> Chroma {
         match self {
-            PixFmt::Nv12 => 0,
-            PixFmt::Yuy2 => 1,
-            _ => 9,
+            PixFmt::Yuy2 => Chroma::S422,
+            PixFmt::Rgb24 => Chroma::S444,
+            _ => Chroma::S420,
         }
     }
+
+    /// Preference when `desired` chroma is wanted (lower is better); None = never use.
+    /// RGB24 is only worth its bandwidth when 4:4:4 is wanted.
+    fn rank_for(self, desired: Chroma) -> Option<u32> {
+        match (desired, self) {
+            (Chroma::S420, PixFmt::Nv12) => Some(0),
+            (Chroma::S420, PixFmt::Yuy2) => Some(1),
+            (Chroma::S422, PixFmt::Yuy2) => Some(0),
+            (Chroma::S422, PixFmt::Nv12) => Some(1),
+            (Chroma::S444, PixFmt::Rgb24) => Some(0),
+            (Chroma::S444, PixFmt::Yuy2) => Some(1),
+            (Chroma::S444, PixFmt::Nv12) => Some(2),
+            _ => None,
+        }
+    }
+}
+
+/// Chroma we produce when capturing `fmt` while `desired` is wanted.
+pub fn output_chroma(fmt: PixFmt, desired: Chroma) -> Chroma {
+    fmt.native_chroma().min(desired)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,7 +137,7 @@ impl VideoMode {
 
 impl fmt::Display for VideoMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}x{} @ {:.2} {:?}", self.width, self.height, self.fps(), self.format)
+        write!(f, "{}x{} @ {:.2} {}", self.width, self.height, self.fps(), self.format.name())
     }
 }
 
@@ -158,7 +197,9 @@ pub struct VideoDevice {
     pub modes: Vec<VideoMode>,
     source: IMFMediaSource,
     reader: IMFSourceReader,
-    current: Option<VideoMode>,
+    current: Option<(VideoMode, Chroma)>,
+    /// MF_MT_DEFAULT_STRIDE of the current type (negative = bottom-up).
+    default_stride: i32,
 }
 
 impl VideoDevice {
@@ -197,17 +238,16 @@ impl VideoDevice {
                 .with_context(|| format!("creating source reader for '{name}' (is another app using it?)"))?;
 
             let modes = enumerate_modes(&reader)?;
-            Ok(Self { name, modes, source, reader, current: None })
+            Ok(Self { name, modes, source, reader, current: None, default_stride: 0 })
         }
     }
 
-    /// Best mode for the preference: exact match if possible (NV12 over YUY2), otherwise the
-    /// largest mode up to 3840x2160, then highest fps.
-    pub fn choose_mode(&self, pref: Option<&ModePref>) -> Option<VideoMode> {
-        choose_mode(&self.modes, pref)
+    /// Best mode (and the chroma it will yield) for the preferences; see [`choose_mode`].
+    pub fn choose_mode(&self, pref: Option<&ModePref>, chroma: Chroma) -> Option<(VideoMode, Chroma)> {
+        choose_mode(&self.modes, pref, chroma)
     }
 
-    pub fn set_mode(&mut self, mode: &VideoMode) -> Result<()> {
+    pub fn set_mode(&mut self, mode: &VideoMode, chroma: Chroma) -> Result<()> {
         unsafe {
             let mt = self.reader.GetNativeMediaType(VIDEO_STREAM, mode.index)?;
             self.reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
@@ -215,15 +255,23 @@ impl VideoDevice {
             self.reader
                 .SetCurrentMediaType(VIDEO_STREAM, None, &mt)
                 .with_context(|| format!("setting mode {mode}"))?;
+            let bpp = match mode.format {
+                PixFmt::Rgb24 => 3,
+                PixFmt::Yuy2 => 2,
+                _ => 1,
+            };
+            // RGB types without an explicit stride are bottom-up by MF convention.
+            let fallback = if mode.format == PixFmt::Rgb24 { -(mode.width as i32 * bpp) } else { mode.width as i32 * bpp };
+            self.default_stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(fallback);
         }
-        self.current = Some(*mode);
+        self.current = Some((*mode, chroma));
         Ok(())
     }
 
-    /// Blocks until the next frame and converts it to packed NV12. Returns `Ok(None)` for
-    /// stream ticks / gaps.
+    /// Blocks until the next frame and converts it to the packed Y + interleaved-UV layout.
+    /// Returns `Ok(None)` for stream ticks / gaps.
     pub fn read_frame(&mut self, pool: &Arc<FramePool>, seq: u64) -> Result<Option<VideoFrame>> {
-        let mode = self.current.ok_or_else(|| anyhow!("mode not set"))?;
+        let (mode, chroma) = self.current.ok_or_else(|| anyhow!("mode not set"))?;
         unsafe {
             let mut flags = 0u32;
             let mut ts = 0i64;
@@ -240,42 +288,83 @@ impl VideoDevice {
             let buffer = sample.ConvertToContiguousBuffer()?;
 
             let (w, h) = (mode.width as usize, mode.height as usize);
-            let mut out = pool.get(w * h * 3 / 2);
+            let mut out = pool.get(super::frame_len(mode.width, mode.height, chroma));
 
-            // Prefer the 2D interface: it gives us the real pitch.
+            // Prefer the 2D interface: it gives the real pitch and the top row even for
+            // bottom-up images. Otherwise fall back to the media type's default stride.
             if let Ok(buf2d) = windows::core::Interface::cast::<IMF2DBuffer>(&buffer) {
                 let mut scan0: *mut u8 = std::ptr::null_mut();
                 let mut pitch = 0i32;
                 buf2d.Lock2D(&mut scan0, &mut pitch)?;
-                let res = if pitch <= 0 {
-                    Err(anyhow!("bottom-up frames are not supported"))
-                } else {
-                    // NV12: Y plane + half-height UV plane. YUY2: one packed plane (pitch = 2*w).
-                    let len = match mode.format {
-                        PixFmt::Nv12 => pitch as usize * h * 3 / 2,
-                        _ => pitch as usize * h,
-                    };
-                    let src = std::slice::from_raw_parts(scan0, len);
-                    convert(mode.format, src, pitch as usize, w, h, out.as_mut_slice())
-                };
+                let res = convert_raw(mode.format, chroma, scan0, pitch as isize, None, w, h, out.as_mut_slice());
                 let _ = buf2d.Unlock2D();
                 res?;
             } else {
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 let mut cur = 0u32;
                 buffer.Lock(&mut ptr, None, Some(&mut cur))?;
-                let src = std::slice::from_raw_parts(ptr, cur as usize);
-                let pitch = match mode.format {
-                    PixFmt::Yuy2 => w * 2,
-                    _ => w,
-                };
-                let res = convert(mode.format, src, pitch, w, h, out.as_mut_slice());
+                let stride = self.default_stride as isize;
+                let top = if stride < 0 { ptr.offset(-stride * (h as isize - 1)) } else { ptr };
+                let res = convert_raw(mode.format, chroma, top, stride, Some(cur as usize), w, h, out.as_mut_slice());
                 let _ = buffer.Unlock();
                 res?;
             }
 
-            Ok(Some(VideoFrame { width: mode.width, height: mode.height, data: out, pts_us, seq }))
+            Ok(Some(VideoFrame { width: mode.width, height: mode.height, chroma, data: out, pts_us, seq }))
         }
+    }
+}
+
+/// Builds row slices from a locked buffer (top row pointer + signed pitch) and converts.
+/// `len` is the locked length for sanity checks when known.
+#[allow(clippy::too_many_arguments)]
+unsafe fn convert_raw(
+    fmt: PixFmt,
+    chroma: Chroma,
+    top: *const u8,
+    pitch: isize,
+    len: Option<usize>,
+    w: usize,
+    h: usize,
+    out: &mut [u8],
+) -> Result<()> {
+    if top.is_null() || pitch == 0 {
+        bail!("empty frame buffer");
+    }
+    let row_bytes = match fmt {
+        PixFmt::Rgb24 => w * 3,
+        PixFmt::Yuy2 => w * 2,
+        _ => w,
+    };
+    if (pitch.unsigned_abs()) < row_bytes {
+        bail!("pitch {pitch} smaller than a row ({row_bytes} bytes)");
+    }
+    match fmt {
+        PixFmt::Nv12 | PixFmt::Yuy2 => {
+            if pitch < 0 {
+                bail!("bottom-up {fmt:?} is not supported");
+            }
+            let pitch = pitch as usize;
+            let need = match fmt {
+                PixFmt::Nv12 => pitch * h * 3 / 2,
+                _ => pitch * h,
+            };
+            if len.is_some_and(|l| l < need) {
+                bail!("short {fmt:?} buffer ({} < {need})", len.unwrap());
+            }
+            let src = std::slice::from_raw_parts(top, need);
+            convert(fmt, chroma, src, pitch, w, h, out)
+        }
+        PixFmt::Rgb24 => {
+            if len.is_some_and(|l| l < pitch.unsigned_abs() * (h - 1) + row_bytes) {
+                bail!("short RGB24 buffer");
+            }
+            let rows: Vec<&[u8]> =
+                (0..h).map(|r| std::slice::from_raw_parts(top.offset(r as isize * pitch), row_bytes)).collect();
+            bgr24_to_nv24(&rows, w, out);
+            Ok(())
+        }
+        other => bail!("unsupported pixel format {other:?}"),
     }
 }
 
@@ -312,29 +401,52 @@ unsafe fn enumerate_modes(reader: &IMFSourceReader) -> Result<Vec<VideoMode>> {
     Ok(modes)
 }
 
-pub fn choose_mode(modes: &[VideoMode], pref: Option<&ModePref>) -> Option<VideoMode> {
-    let usable = || modes.iter().filter(|m| m.format.supported() && m.width % 2 == 0 && m.height % 2 == 0);
+/// Picks a capture mode and the chroma it yields.
+///
+/// With a resolution/fps preference: the matching mode in the format that best delivers
+/// `chroma` (e.g. RGB24 for 4:4:4, YUY2 for 4:2:2), falling back to lower chroma when that
+/// mode doesn't offer it. Without one: the largest mode up to 4K / 60 fps, preferring modes
+/// that actually deliver the desired chroma.
+pub fn choose_mode(modes: &[VideoMode], pref: Option<&ModePref>, chroma: Chroma) -> Option<(VideoMode, Chroma)> {
+    let usable = || {
+        modes
+            .iter()
+            .filter(|m| m.format.supported() && m.width % 2 == 0 && m.height % 2 == 0)
+            .filter(move |m| m.format.rank_for(chroma).is_some())
+    };
+    let rank = |m: &VideoMode| m.format.rank_for(chroma).unwrap_or(9);
+    let with_chroma = |m: &VideoMode| (*m, output_chroma(m.format, chroma));
+
     if let Some(p) = pref {
-        if let Some(m) = usable().filter(|m| m.matches(p)).min_by_key(|m| m.format.rank()) {
-            return Some(*m);
+        if let Some(m) = usable().filter(|m| m.matches(p)).min_by_key(|m| rank(m)) {
+            return Some(with_chroma(m));
         }
     }
-    // Default: up to 4K, at most ~60 fps (high-refresh modes are opt-in via Settings).
+    // Default: up to 4K, at most ~60 fps (high-refresh modes are opt-in).
     let default_ok = |m: &&VideoMode| m.width <= 3840 && m.height <= 2160 && m.fps() <= 60.5;
     let pool: Vec<&VideoMode> =
         if usable().any(|m| default_ok(&m)) { usable().filter(default_ok).collect() } else { usable().collect() };
-    pool.into_iter()
-        .max_by(|a, b| {
-            let ka = (a.width * a.height, (a.fps() * 100.0) as u64, std::cmp::Reverse(a.format.rank()));
-            let kb = (b.width * b.height, (b.fps() * 100.0) as u64, std::cmp::Reverse(b.format.rank()));
-            ka.cmp(&kb)
-        })
-        .copied()
+    let key = |m: &VideoMode| {
+        (
+            output_chroma(m.format, chroma) == chroma,
+            m.width * m.height,
+            (m.fps() * 100.0) as u64,
+            std::cmp::Reverse(rank(m)),
+        )
+    };
+    pool.into_iter().max_by(|a, b| key(a).cmp(&key(b))).map(|m| with_chroma(m))
 }
 
-/// Converts a locked capture buffer into packed NV12.
-fn convert(fmt: PixFmt, src: &[u8], pitch: usize, w: usize, h: usize, out: &mut [u8]) -> Result<()> {
+/// Converts a locked NV12/YUY2 buffer (top-down, positive pitch) into the packed layout.
+fn convert(fmt: PixFmt, chroma: Chroma, src: &[u8], pitch: usize, w: usize, h: usize, out: &mut [u8]) -> Result<()> {
     match fmt {
+        PixFmt::Yuy2 if chroma == Chroma::S422 => {
+            if src.len() < pitch * h {
+                bail!("short YUY2 buffer");
+            }
+            yuy2_to_nv16(src, pitch, w, h, out);
+            Ok(())
+        }
         PixFmt::Nv12 => {
             if src.len() < pitch * h * 3 / 2 {
                 bail!("short NV12 buffer ({} < {})", src.len(), pitch * h * 3 / 2);
@@ -380,13 +492,55 @@ pub fn yuy2_to_nv12(src: &[u8], pitch: usize, w: usize, h: usize, out: &mut [u8]
     }
 }
 
+/// YUY2 (Y0 U Y1 V) -> NV16 (4:2:2: full-height interleaved UV, no chroma loss).
+pub fn yuy2_to_nv16(src: &[u8], pitch: usize, w: usize, h: usize, out: &mut [u8]) {
+    let (y_out, uv_out) = out.split_at_mut(w * h);
+    for row in 0..h {
+        let s = &src[row * pitch..row * pitch + w * 2];
+        let y = &mut y_out[row * w..(row + 1) * w];
+        let uv = &mut uv_out[row * w..(row + 1) * w];
+        for ((dy, duv), px) in y.chunks_exact_mut(2).zip(uv.chunks_exact_mut(2)).zip(s.chunks_exact(4)) {
+            dy[0] = px[0];
+            dy[1] = px[2];
+            duv[0] = px[1];
+            duv[1] = px[3];
+        }
+    }
+}
+
+/// Packed BGR24 rows (top to bottom) -> NV24 (4:4:4), BT.709 limited range, fixed point.
+/// Split across a few threads: 1440p60 is ~220 Mpixel/s.
+pub fn bgr24_to_nv24(rows: &[&[u8]], w: usize, out: &mut [u8]) {
+    let h = rows.len();
+    let (y_out, uv_out) = out.split_at_mut(w * h);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 6);
+    let band = h.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for ((rows, y), uv) in rows.chunks(band).zip(y_out.chunks_mut(band * w)).zip(uv_out.chunks_mut(band * w * 2)) {
+            s.spawn(move || {
+                for (r, src) in rows.iter().enumerate() {
+                    let y = &mut y[r * w..(r + 1) * w];
+                    let uv = &mut uv[r * w * 2..(r + 1) * w * 2];
+                    for ((px, dy), duv) in src.chunks_exact(3).zip(y.iter_mut()).zip(uv.chunks_exact_mut(2)) {
+                        let (b, g, r) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                        *dy = ((47 * r + 157 * g + 16 * b + 128) >> 8) as u8 + 16;
+                        duv[0] = ((-26 * r - 86 * g + 112 * b + 128) >> 8).wrapping_add(128).clamp(16, 240) as u8;
+                        duv[1] = ((112 * r - 102 * g - 10 * b + 128) >> 8).wrapping_add(128).clamp(16, 240) as u8;
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// Capture loop with automatic reconnect. Runs until `stop` is set. `on_open` is called each
-/// time the device is (re)opened with the chosen mode.
+/// time the device is (re)opened with the chosen mode and the chroma it delivers.
 pub fn run_capture(
     device: Option<String>,
     pref: Option<ModePref>,
+    chroma: Chroma,
     stop: Arc<AtomicBool>,
-    mut on_open: impl FnMut(Result<(String, Vec<VideoMode>, VideoMode)>),
+    mut on_open: impl FnMut(Result<(String, Vec<VideoMode>, VideoMode, Chroma)>),
     mut on_frame: impl FnMut(Arc<VideoFrame>),
 ) {
     let _com = match super::ComGuard::new() {
@@ -403,10 +557,10 @@ pub fn run_capture(
     while !stop.load(Ordering::Relaxed) {
         let opened = (|| -> Result<VideoDevice> {
             let mut dev = VideoDevice::open(device.as_deref())?;
-            let mode = dev
-                .choose_mode(pref.as_ref())
-                .ok_or_else(|| anyhow!("'{}' offers no NV12/YUY2 modes: {:?}", dev.name, dev.modes))?;
-            dev.set_mode(&mode)?;
+            let (mode, out_chroma) = dev
+                .choose_mode(pref.as_ref(), chroma)
+                .ok_or_else(|| anyhow!("'{}' offers no NV12/YUY2/RGB24 modes: {:?}", dev.name, dev.modes))?;
+            dev.set_mode(&mode, out_chroma)?;
             Ok(dev)
         })();
         let mut dev = match opened {
@@ -417,9 +571,9 @@ pub fn run_capture(
                 continue;
             }
         };
-        let mode = dev.current.unwrap();
-        tracing::info!("capturing '{}' at {mode}", dev.name);
-        on_open(Ok((dev.name.clone(), dev.modes.clone(), mode)));
+        let (mode, out_chroma) = dev.current.unwrap();
+        tracing::info!("capturing '{}' at {mode} -> {}", dev.name, out_chroma.label());
+        on_open(Ok((dev.name.clone(), dev.modes.clone(), mode, out_chroma)));
 
         while !stop.load(Ordering::Relaxed) {
             match dev.read_frame(&pool, seq) {
@@ -472,14 +626,80 @@ mod tests {
             m(5, 7680, 4320, 30, PixFmt::Nv12),
             m(6, 3840, 2160, 144, PixFmt::Nv12),
         ];
-        assert_eq!(choose_mode(&modes, None).unwrap().index, 3);
+        let pick = |p: Option<&ModePref>| choose_mode(&modes, p, Chroma::S420).unwrap();
+        assert_eq!(pick(None), (modes[3], Chroma::S420));
         let pref = ModePref { width: 1920, height: 1080, fps: 60.0 };
-        assert_eq!(choose_mode(&modes, Some(&pref)).unwrap().index, 0);
+        assert_eq!(pick(Some(&pref)), (modes[0], Chroma::S420)); // YUY2 downsampled to 4:2:0
         let missing = ModePref { width: 1280, height: 720, fps: 60.0 };
-        assert_eq!(choose_mode(&modes, Some(&missing)).unwrap().index, 3);
+        assert_eq!(pick(Some(&missing)).0.index, 3);
         // High refresh is only used when asked for explicitly.
         let hfr = ModePref { width: 3840, height: 2160, fps: 144.0 };
-        assert_eq!(choose_mode(&modes, Some(&hfr)).unwrap().index, 6);
+        assert_eq!(pick(Some(&hfr)).0.index, 6);
+    }
+
+    #[test]
+    fn picks_format_for_chroma() {
+        let modes = [
+            m(0, 3840, 2160, 60, PixFmt::Nv12),
+            m(1, 2560, 1440, 60, PixFmt::Nv12),
+            m(2, 2560, 1440, 60, PixFmt::Yuy2),
+            m(3, 2560, 1440, 60, PixFmt::Rgb24),
+            m(4, 3840, 2160, 30, PixFmt::Yuy2),
+        ];
+        let p1440 = ModePref { width: 2560, height: 1440, fps: 60.0 };
+        let p4k60 = ModePref { width: 3840, height: 2160, fps: 60.0 };
+        assert_eq!(choose_mode(&modes, Some(&p1440), Chroma::S420).unwrap(), (modes[1], Chroma::S420));
+        assert_eq!(choose_mode(&modes, Some(&p1440), Chroma::S422).unwrap(), (modes[2], Chroma::S422));
+        assert_eq!(choose_mode(&modes, Some(&p1440), Chroma::S444).unwrap(), (modes[3], Chroma::S444));
+        // 4K60 has no 4:4:4 here: fall back to what that mode offers.
+        assert_eq!(choose_mode(&modes, Some(&p4k60), Chroma::S444).unwrap(), (modes[0], Chroma::S420));
+        // Auto + 4:4:4 prefers a mode that really delivers 4:4:4 over a bigger 4:2:0 one.
+        assert_eq!(choose_mode(&modes, None, Chroma::S444).unwrap(), (modes[3], Chroma::S444));
+        // Auto + 4:2:2: 4K30 YUY2 beats 1440p60 YUY2 on size.
+        assert_eq!(choose_mode(&modes, None, Chroma::S422).unwrap(), (modes[4], Chroma::S422));
+    }
+
+    #[test]
+    fn yuy2_to_422_keeps_all_chroma() {
+        let src = [
+            10, 100, 20, 200, 30, 101, 40, 201, //
+            50, 1, 60, 2, 70, 3, 80, 4,
+        ];
+        let mut out = vec![0u8; 4 * 2 * 2];
+        yuy2_to_nv16(&src, 8, 4, 2, &mut out);
+        assert_eq!(&out[..8], &[10, 20, 30, 40, 50, 60, 70, 80]);
+        assert_eq!(&out[8..], &[100, 200, 101, 201, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn bgr_to_444_reference_colors() {
+        // white, black, pure red, pure blue (BGR byte order)
+        let row0: &[u8] = &[255, 255, 255, 0, 0, 0];
+        let row1: &[u8] = &[0, 0, 255, 255, 0, 0];
+        let mut out = vec![0u8; 2 * 2 * 3];
+        bgr24_to_nv24(&[row0, row1], 2, &mut out);
+        let (y, uv) = out.split_at(4);
+        assert_eq!(y[0], 235); // white
+        assert_eq!(y[1], 16); // black
+        assert_eq!(&uv[0..4], &[128, 128, 128, 128]); // neutral chroma
+        // BT.709 red: Y≈63, Cb≈102, Cr=240 ; blue: Y≈32, Cb=240, Cr≈118
+        assert!((62..=64).contains(&y[2]), "{}", y[2]);
+        assert!((101..=103).contains(&uv[4]) && uv[5] == 240, "{:?}", &uv[4..6]);
+        assert!((31..=33).contains(&y[3]), "{}", y[3]);
+        assert!(uv[6] == 240 && (117..=119).contains(&uv[7]), "{:?}", &uv[6..8]);
+    }
+
+    #[test]
+    fn bottom_up_rgb_is_flipped() {
+        // Memory holds the bottom row first (pitch negative): top row = red, bottom = blue.
+        let mem: [u8; 6] = [255, 0, 0, /* bottom: blue */ 0, 0, 255 /* top: red */];
+        let mut out = vec![0u8; 1 * 2 * 3];
+        unsafe {
+            let top = mem.as_ptr().add(3);
+            convert_raw(PixFmt::Rgb24, Chroma::S444, top, -3, None, 1, 2, &mut out).unwrap();
+        }
+        assert!((62..=64).contains(&out[0]), "top row should be red: {out:?}");
+        assert!((31..=33).contains(&out[1]), "bottom row should be blue: {out:?}");
     }
 
     #[test]
@@ -500,7 +720,7 @@ mod tests {
         // 2x2 image with pitch 4.
         let src = [1, 2, 0, 0, 3, 4, 0, 0, 9, 8, 0, 0];
         let mut out = vec![0u8; 6];
-        convert(PixFmt::Nv12, &src, 4, 2, 2, &mut out).unwrap();
+        convert(PixFmt::Nv12, Chroma::S420, &src, 4, 2, 2, &mut out).unwrap();
         assert_eq!(out, [1, 2, 3, 4, 9, 8]);
     }
 }

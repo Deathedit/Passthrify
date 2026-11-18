@@ -2,7 +2,7 @@ use eframe::egui;
 
 use super::pickers;
 use crate::capture::video_mf::VideoMode;
-use crate::config::{Config, PresentMode};
+use crate::config::{Chroma, Config, PresentMode};
 
 pub enum SettingsOutcome {
     Open,
@@ -12,6 +12,8 @@ pub enum SettingsOutcome {
 
 pub struct SettingsUi {
     draft: Config,
+    /// Mode preference that is currently running (to tell whether `actual` chroma applies).
+    applied_mode: Option<crate::config::ModePref>,
     video_devices: Vec<String>,
     audio_inputs: Vec<String>,
     audio_outputs: Vec<String>,
@@ -20,13 +22,15 @@ pub struct SettingsUi {
 impl SettingsUi {
     pub fn new(cfg: &Config) -> Self {
         let (video_devices, audio_inputs, audio_outputs) = crate::capture::enumerate_all();
-        Self { draft: cfg.clone(), video_devices, audio_inputs, audio_outputs }
+        Self { draft: cfg.clone(), applied_mode: cfg.video_mode, video_devices, audio_inputs, audio_outputs }
     }
 
     /// Keeps the draft in step with changes made from the toolbar while the window is open.
     pub fn sync_capture(&mut self, cfg: &Config) {
         self.draft.video_mode = cfg.video_mode;
         self.draft.codec = cfg.codec;
+        self.draft.chroma = cfg.chroma;
+        self.applied_mode = cfg.video_mode;
     }
 
     pub fn show(
@@ -34,6 +38,7 @@ impl SettingsUi {
         ctx: &egui::Context,
         modes: &[VideoMode],
         current: Option<VideoMode>,
+        actual_chroma: Option<Chroma>,
         hotkey_errors: &[String],
     ) -> SettingsOutcome {
         let mut outcome = SettingsOutcome::Open;
@@ -60,9 +65,16 @@ impl SettingsUi {
                     pickers::rate_picker(ui, "settings", &mut d.video_mode, modes, current, 280.0);
                     ui.end_row();
 
+                    ui.label("Chroma");
+                    let av = pickers::available_for(modes, d.video_mode.as_ref(), current);
+                    // Only show the "→ actual" hint when the draft matches what's running.
+                    let actual = actual_chroma.filter(|_| d.video_mode == self.applied_mode);
+                    pickers::chroma_picker(ui, "settings", &mut d.chroma, &mut d.codec, &av, actual, 280.0);
+                    ui.end_row();
+
                     section(ui, "Encoding");
                     ui.label("Codec");
-                    pickers::codec_picker(ui, "settings", &mut d.codec, false, 280.0);
+                    pickers::codec_picker(ui, "settings", &mut d.codec, d.chroma, false, 280.0);
                     ui.end_row();
                     ui.label("Bitrate");
                     ui.horizontal(|ui| {

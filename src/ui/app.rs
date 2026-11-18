@@ -101,21 +101,27 @@ impl App {
             // Quick capture/encode switches; applied immediately (restarts the pipeline).
             let mut pref = self.cfg.video_mode;
             let mut codec = self.cfg.codec;
+            let mut chroma = self.cfg.chroma;
+            let actual_chroma = *st.chroma.lock();
             let changed = ui
                 .add_enabled_ui(!recording, |ui| {
-                    let mut c = pickers::resolution_picker(ui, "toolbar", &mut pref, &modes, mode, 120.0);
+                    let mut c = pickers::resolution_picker(ui, "toolbar", &mut pref, &modes, mode, 150.0);
                     c |= pickers::rate_picker(ui, "toolbar", &mut pref, &modes, mode, 92.0);
-                    c |= pickers::codec_picker(ui, "toolbar", &mut codec, true, 62.0);
+                    let av = pickers::available_for(&modes, pref.as_ref(), mode);
+                    c |= pickers::chroma_picker(ui, "toolbar", &mut chroma, &mut codec, &av, actual_chroma, 64.0);
+                    c |= pickers::codec_picker(ui, "toolbar", &mut codec, chroma, true, 62.0);
                     c
                 })
                 .inner;
             if recording {
-                ui.label(RichText::new("🔒").weak()).on_hover_text("Stop recording to change resolution, frame rate or codec");
+                ui.label(RichText::new("🔒").weak())
+                    .on_hover_text("Stop recording to change resolution, frame rate, chroma or codec");
             }
             if changed {
                 let mut c = self.cfg.clone();
                 c.video_mode = pref;
                 c.codec = codec;
+                c.chroma = chroma;
                 self.apply_settings(c);
                 if let Some(s) = self.settings.as_mut() {
                     s.sync_capture(&self.cfg);
@@ -312,7 +318,8 @@ impl eframe::App for App {
         if let Some(s) = self.settings.as_mut() {
             let modes = self.shared.status.modes.lock().clone();
             let current = *self.shared.status.mode.lock();
-            match s.show(ctx, &modes, current, &self.hotkey_errors) {
+            let actual_chroma = *self.shared.status.chroma.lock();
+            match s.show(ctx, &modes, current, actual_chroma, &self.hotkey_errors) {
                 SettingsOutcome::Open => {}
                 SettingsOutcome::Close => self.settings = None,
                 SettingsOutcome::Apply(cfg) => {

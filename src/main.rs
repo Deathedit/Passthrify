@@ -32,7 +32,8 @@ Passthrify - Elgato capture viewer with instant replay
 USAGE:
   passthrify                    start the app
   passthrify --list-devices     list capture devices, their modes and audio endpoints
-  passthrify --selftest [SECS] [--out DIR]
+  passthrify --selftest [SECS] [--out DIR] [--mode WxH@FPS] [--chroma 420|422|444]
+             [--codec hevc|h264|av1] [--cycle-modes]
                                 run capture+encode headless for SECS (default 15), then
                                 save a replay, a screenshot and a short recording
 ";
@@ -59,7 +60,26 @@ fn main() -> Result<()> {
         let secs = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(15);
         let out = args.iter().position(|a| a == "--out").and_then(|j| args.get(j + 1)).cloned();
         let cycle = args.iter().any(|a| a == "--cycle-modes");
-        return selftest(secs, out, cycle);
+        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|j| args.get(j + 1)).cloned();
+        let overrides = SelftestOverrides {
+            chroma: arg("--chroma").map(|c| match c.as_str() {
+                "444" | "4:4:4" => config::Chroma::S444,
+                "422" | "4:2:2" => config::Chroma::S422,
+                _ => config::Chroma::S420,
+            }),
+            mode: arg("--mode").and_then(|m| {
+                // WxH@FPS, e.g. 2560x1440@60
+                let (res, fps) = m.split_once('@')?;
+                let (w, h) = res.split_once('x')?;
+                Some(config::ModePref { width: w.parse().ok()?, height: h.parse().ok()?, fps: fps.parse().ok()? })
+            }),
+            codec: arg("--codec").map(|c| match c.to_lowercase().as_str() {
+                "h264" => config::Codec::H264,
+                "av1" => config::Codec::Av1,
+                _ => config::Codec::Hevc,
+            }),
+        };
+        return selftest(secs, out, cycle, overrides);
     }
     run_gui()
 }
@@ -140,10 +160,11 @@ fn list_devices() -> Result<()> {
         println!("  {}", d.name);
         match capture::video_mf::VideoDevice::open(Some(&d.name)) {
             Ok(dev) => {
-                let best = dev.choose_mode(None);
+                let best = dev.choose_mode(None, config::Chroma::S420).map(|(m, _)| m);
                 for m in &dev.modes {
                     let mark = if Some(*m) == best { "  <- default" } else { "" };
-                    println!("      [{:>2}] {m}{mark}", m.index);
+                    let chroma = if m.format.supported() { m.format.native_chroma().label() } else { "-" };
+                    println!("      [{:>3}] {m} ({chroma}){mark}", m.index);
                 }
             }
             Err(e) => println!("      (can't open: {e:#})"),
@@ -167,10 +188,25 @@ fn list_devices() -> Result<()> {
 }
 
 /// Headless end-to-end check against real hardware.
-fn selftest(secs: u64, out: Option<String>, cycle: bool) -> Result<()> {
+struct SelftestOverrides {
+    chroma: Option<config::Chroma>,
+    mode: Option<config::ModePref>,
+    codec: Option<config::Codec>,
+}
+
+fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) -> Result<()> {
     let mut cfg = Config::load();
     if let Some(o) = out {
         cfg.output_dir = o.into();
+    }
+    if let Some(c) = ov.chroma {
+        cfg.chroma = c;
+    }
+    if ov.mode.is_some() {
+        cfg.video_mode = ov.mode;
+    }
+    if let Some(c) = ov.codec {
+        cfg.codec = c;
     }
     cfg.windows_notifications = false;
     cfg.replay_seconds = cfg.replay_seconds.min(secs.saturating_sub(5).max(5) as u32);

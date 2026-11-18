@@ -5,7 +5,7 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu, CallbackResources, CallbackTrait, RenderState};
 
-use crate::capture::VideoFrame;
+use crate::capture::{Chroma, VideoFrame};
 
 pub struct PreviewRenderer {
     pipeline: wgpu::RenderPipeline,
@@ -17,6 +17,7 @@ pub struct PreviewRenderer {
 struct Textures {
     width: u32,
     height: u32,
+    chroma: Chroma,
     y: wgpu::Texture,
     uv: wgpu::Texture,
     bind: wgpu::BindGroup,
@@ -96,7 +97,8 @@ impl PreviewRenderer {
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, f: &VideoFrame) {
         let (w, h) = (f.width, f.height);
-        if !self.tex.as_ref().is_some_and(|t| t.width == w && t.height == h) {
+        let (cw, ch) = f.chroma_size();
+        if !self.tex.as_ref().is_some_and(|t| t.width == w && t.height == h && t.chroma == f.chroma) {
             let mk = |label, width, height, format| {
                 device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
@@ -110,7 +112,8 @@ impl PreviewRenderer {
                 })
             };
             let y = mk("y", w, h, wgpu::TextureFormat::R8Unorm);
-            let uv = mk("uv", w / 2, h / 2, wgpu::TextureFormat::Rg8Unorm);
+            // Chroma texture at chroma resolution; normalized sampling upsamples it for free.
+            let uv = mk("uv", cw, ch, wgpu::TextureFormat::Rg8Unorm);
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("nv12"),
                 layout: &self.layout,
@@ -126,7 +129,7 @@ impl PreviewRenderer {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 ],
             });
-            self.tex = Some(Textures { width: w, height: h, y, uv, bind, seq: u64::MAX });
+            self.tex = Some(Textures { width: w, height: h, chroma: f.chroma, y, uv, bind, seq: u64::MAX });
         }
         let t = self.tex.as_mut().unwrap();
         if t.seq == f.seq {
@@ -147,7 +150,7 @@ impl PreviewRenderer {
             );
         };
         write(&t.y, f.y_plane(), w, h, w);
-        write(&t.uv, f.uv_plane(), w / 2, h / 2, w);
+        write(&t.uv, f.uv_plane(), cw, ch, cw * 2);
     }
 }
 

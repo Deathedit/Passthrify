@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use crate::audio::PassRing;
 use crate::capture::video_mf::{self, VideoMode};
 use crate::capture::{audio_wasapi, AudioChunk, VideoFrame};
-use crate::config::Config;
+use crate::config::{Chroma, Codec, Config};
 use crate::encode;
 use crate::packets::{PacketBus, StreamParams};
 use crate::recorder::Recorder;
@@ -57,6 +57,8 @@ impl From<Action> for Command {
 pub struct Status {
     pub device: Mutex<String>,
     pub mode: Mutex<Option<VideoMode>>,
+    /// Chroma actually delivered by the current mode (may be lower than requested).
+    pub chroma: Mutex<Option<Chroma>>,
     pub modes: Mutex<Vec<VideoMode>>,
     pub capturing: AtomicBool,
     pub fps_x100: AtomicU32,
@@ -183,7 +185,7 @@ fn control_loop(mut cfg: Config, shared: Arc<Shared>, rx: Receiver<Command>) {
                 Ok(cmd) => session.handle(cmd),
             },
             recv(session.mode_rx) -> m => match m {
-                Ok(mode) => session.on_mode(mode),
+                Ok((mode, chroma)) => session.on_mode(mode, chroma),
                 Err(_) => session.mode_rx = never(),
             },
             default(Duration::from_millis(250)) => session.tick(),
@@ -194,6 +196,7 @@ fn control_loop(mut cfg: Config, shared: Arc<Shared>, rx: Receiver<Command>) {
 
 struct Encoders {
     mode: VideoMode,
+    chroma: Chroma,
     force_idr: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
 }
@@ -203,7 +206,7 @@ struct Session {
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    mode_rx: Receiver<VideoMode>,
+    mode_rx: Receiver<(VideoMode, Chroma)>,
     frame_tx: Arc<Mutex<Option<Sender<Arc<VideoFrame>>>>>,
     audio_tx: Arc<Mutex<Option<Sender<AudioChunk>>>>,
     encoders: Option<Encoders>,
@@ -228,23 +231,25 @@ impl Session {
         {
             let (sh_open, sh_frame) = (shared.clone(), shared.clone());
             let (stop, frame_tx) = (stop.clone(), frame_tx.clone());
-            let (device, pref) = (cfg.video_device.clone(), cfg.video_mode);
+            let (device, pref, chroma) = (cfg.video_device.clone(), cfg.video_mode, cfg.chroma);
             threads.push(spawn("video-capture", move || {
                 let mut fps_frames = 0u32;
                 let mut fps_since = Instant::now();
                 video_mf::run_capture(
                     device,
                     pref,
+                    chroma,
                     stop,
                     move |res| match res {
-                        Ok((name, modes, mode)) => {
+                        Ok((name, modes, mode, out_chroma)) => {
                             let st = &sh_open.status;
                             *st.device.lock() = name;
                             *st.modes.lock() = modes;
                             *st.mode.lock() = Some(mode);
+                            *st.chroma.lock() = Some(out_chroma);
                             st.capturing.store(true, Ordering::Relaxed);
                             sh_open.set_error(None);
-                            let _ = mode_tx.send(mode);
+                            let _ = mode_tx.send((mode, out_chroma));
                         }
                         Err(e) => {
                             sh_open.status.capturing.store(false, Ordering::Relaxed);
@@ -326,24 +331,32 @@ impl Session {
         }
     }
 
-    fn on_mode(&mut self, mode: VideoMode) {
-        if self.encoders.as_ref().is_some_and(|e| e.mode.same_shape(&mode)) {
+    fn on_mode(&mut self, mode: VideoMode, chroma: Chroma) {
+        if self.encoders.as_ref().is_some_and(|e| e.mode.same_shape(&mode) && e.chroma == chroma) {
             return;
         }
         self.stop_encoders();
-        self.start_encoders(mode);
+        self.start_encoders(mode, chroma);
     }
 
-    fn start_encoders(&mut self, mode: VideoMode) {
+    fn start_encoders(&mut self, mode: VideoMode, chroma: Chroma) {
         self.bus.clear();
         self.params.clear();
         let (ftx, frx) = bounded::<Arc<VideoFrame>>(4);
         let (atx, arx) = bounded::<AudioChunk>(256);
         let force_idr = Arc::new(AtomicBool::new(false));
-        let bitrate = self.cfg.bitrate_bps(mode.width, mode.height, mode.fps());
-        let vcfg = encode::video::VideoEncoderConfig { codec: self.cfg.codec, mode, bitrate };
+        let mut codec = self.cfg.codec;
+        if !codec.supports(chroma) {
+            codec = Codec::Hevc;
+            self.shared.notify(
+                format!("{} can't encode {}; using HEVC instead", self.cfg.codec.short_label(), chroma.label()),
+                true,
+            );
+        }
+        let bitrate = self.cfg.bitrate_bps(mode.width, mode.height, mode.fps(), chroma);
+        let vcfg = encode::video::VideoEncoderConfig { codec, mode, chroma, bitrate };
         *self.shared.status.encoder.lock() =
-            format!("{} {:.0} Mbps", self.cfg.codec.nvenc_name(), bitrate as f64 / 1e6);
+            format!("{} {} {:.0} Mbps", codec.nvenc_name(), chroma.label(), bitrate as f64 / 1e6);
 
         let mut joins = Vec::new();
         {
@@ -365,7 +378,7 @@ impl Session {
         }
         *self.frame_tx.lock() = Some(ftx);
         *self.audio_tx.lock() = Some(atx);
-        self.encoders = Some(Encoders { mode, force_idr, joins });
+        self.encoders = Some(Encoders { mode, chroma, force_idr, joins });
     }
 
     fn stop_encoders(&mut self) {
