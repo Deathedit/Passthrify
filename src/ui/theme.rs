@@ -197,12 +197,18 @@ pub mod icons {
 pub const MARK_GLYPH: (&str, &[u8]) =
     ("bytes://passthrify-mark-glyph.svg", include_bytes!("../../assets/logo/passthrify-mark-glyph.svg"));
 
+/// egui 0.31 caches textures by URI alone, so an SVG first drawn at 16 px would be reused,
+/// blurry, at 72 px. Giving each display size its own URI makes each one rasterize crisply.
+fn sized_uri(uri: &str, size: f32) -> String {
+    format!("{}@{}.svg", uri.trim_end_matches(".svg"), size.round() as u32)
+}
+
 pub fn icon_image(icon: (&'static str, &'static [u8]), size: f32, tint: Color32) -> egui::Image<'static> {
-    egui::Image::from_bytes(icon.0, icon.1).fit_to_exact_size(Vec2::splat(size)).tint(tint)
+    egui::Image::from_bytes(sized_uri(icon.0, size), icon.1).fit_to_exact_size(Vec2::splat(size)).tint(tint)
 }
 
 pub fn mark_image(size: f32) -> egui::Image<'static> {
-    egui::Image::from_bytes(MARK_GLYPH.0, MARK_GLYPH.1).fit_to_exact_size(Vec2::splat(size))
+    egui::Image::from_bytes(sized_uri(MARK_GLYPH.0, size), MARK_GLYPH.1).fit_to_exact_size(Vec2::splat(size))
 }
 
 // --- Widgets -------------------------------------------------------------------------------
