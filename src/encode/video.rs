@@ -31,6 +31,20 @@ fn pixel_format(chroma: Chroma) -> ff::format::Pixel {
     }
 }
 
+/// NVENC preset for a mode. p5 is the quality sweet spot up to 4K60, but NVENC can't sustain it
+/// at higher pixel rates (4K144 dropped ~20 fps at p5), so step down for high-refresh modes.
+pub fn preset_for(m: &VideoMode) -> &'static str {
+    let pixel_rate = m.width as f64 * m.height as f64 * m.fps();
+    let uhd60 = 3840.0 * 2160.0 * 61.0;
+    if pixel_rate > uhd60 * 1.7 {
+        "p2"
+    } else if pixel_rate > uhd60 {
+        "p3"
+    } else {
+        "p5"
+    }
+}
+
 pub fn open(cfg: &VideoEncoderConfig) -> Result<ff::encoder::Video> {
     if !cfg.codec.supports(cfg.chroma) {
         anyhow::bail!("{} can't encode {} on NVENC; pick HEVC or H.264", cfg.codec.short_label(), cfg.chroma.label());
@@ -60,7 +74,7 @@ pub fn open(cfg: &VideoEncoderConfig) -> Result<ff::encoder::Video> {
     }
 
     let mut opts = ff::Dictionary::new();
-    opts.set("preset", "p5");
+    opts.set("preset", preset_for(m));
     opts.set("tune", "hq");
     opts.set("rc", "vbr");
     opts.set("forced-idr", "1");
@@ -88,11 +102,12 @@ pub fn run(
     let mut enc = open(&cfg)?;
     *params.video.lock() = Some(SendParams(super::params_of(&enc)));
     tracing::info!(
-        "video encoder {} {} {} @ {:.1} Mbps",
+        "video encoder {} {} {} @ {:.1} Mbps (preset {})",
         cfg.codec.nvenc_name(),
         cfg.mode,
         cfg.chroma.label(),
-        cfg.bitrate as f64 / 1e6
+        cfg.bitrate as f64 / 1e6,
+        preset_for(&cfg.mode)
     );
 
     let (w, h) = (cfg.mode.width, cfg.mode.height);
@@ -173,5 +188,25 @@ fn drain(enc: &mut ff::encoder::Video, pkt: &mut ff::Packet, sink: &mut impl FnM
             duration_us: pkt.duration(),
             key: pkt.is_key(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::video_mf::PixFmt;
+
+    fn mode(w: u32, h: u32, fps: u32) -> VideoMode {
+        VideoMode { index: 0, width: w, height: h, fps_num: fps, fps_den: 1, format: PixFmt::Nv12 }
+    }
+
+    #[test]
+    fn faster_presets_for_high_pixel_rates() {
+        assert_eq!(preset_for(&mode(3840, 2160, 60)), "p5");
+        assert_eq!(preset_for(&mode(2560, 1440, 144)), "p3"); // 530 Mpx/s, just above 4K60
+        assert_eq!(preset_for(&mode(3840, 2160, 120)), "p2");
+        assert_eq!(preset_for(&mode(3840, 2160, 144)), "p2");
+        assert_eq!(preset_for(&mode(1920, 1080, 240)), "p5");
+        assert_eq!(preset_for(&mode(3440, 1440, 144)), "p3");
     }
 }
