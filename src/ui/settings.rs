@@ -616,12 +616,12 @@ impl SettingsUi {
                         let total_mb = rel.zip_size as f64 / 1_048_576.0;
                         let done_mb = total_mb * progress as f64;
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Downloading…").size(12.0).color(theme::TEXT2));
+                            ui.label(RichText::new("Downloading…").size(12.0).color(egui::Color32::WHITE));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(
                                     RichText::new(format!("{done_mb:.0} / {total_mb:.0} MB · {:.0}%", progress * 100.0))
                                         .font(theme::mono(11.0))
-                                        .color(theme::TEXT),
+                                        .color(egui::Color32::WHITE),
                                 );
                             });
                         });
