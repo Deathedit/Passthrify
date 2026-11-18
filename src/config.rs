@@ -20,6 +20,14 @@ impl Codec {
         }
     }
 
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Codec::Hevc => "HEVC",
+            Codec::H264 => "H.264",
+            Codec::Av1 => "AV1",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Codec::Hevc => "HEVC (H.265)",

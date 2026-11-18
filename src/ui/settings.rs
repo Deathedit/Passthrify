@@ -1,7 +1,8 @@
 use eframe::egui;
 
+use super::pickers;
 use crate::capture::video_mf::VideoMode;
-use crate::config::{Codec, Config, ModePref, PresentMode};
+use crate::config::{Config, PresentMode};
 
 pub enum SettingsOutcome {
     Open,
@@ -22,7 +23,19 @@ impl SettingsUi {
         Self { draft: cfg.clone(), video_devices, audio_inputs, audio_outputs }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, modes: &[VideoMode], hotkey_errors: &[String]) -> SettingsOutcome {
+    /// Keeps the draft in step with changes made from the toolbar while the window is open.
+    pub fn sync_capture(&mut self, cfg: &Config) {
+        self.draft.video_mode = cfg.video_mode;
+        self.draft.codec = cfg.codec;
+    }
+
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        modes: &[VideoMode],
+        current: Option<VideoMode>,
+        hotkey_errors: &[String],
+    ) -> SettingsOutcome {
         let mut outcome = SettingsOutcome::Open;
         let mut open = true;
         egui::Window::new("Settings")
@@ -39,29 +52,26 @@ impl SettingsUi {
                     optional_combo(ui, "video_dev", &mut d.video_device, &self.video_devices, "Auto (Elgato)");
                     ui.end_row();
 
-                    ui.label("Mode");
-                    let current = match &d.video_mode {
-                        Some(p) => format!("{}x{} @ {:.2}", p.width, p.height, p.fps),
-                        None => "Best available".into(),
-                    };
-                    egui::ComboBox::from_id_salt("mode").selected_text(current).width(280.0).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.video_mode, None, "Best available");
-                        // Highest resolution first; within a resolution, highest fps first.
-                        let mut sorted: Vec<&VideoMode> = modes.iter().filter(|m| m.format.supported()).collect();
-                        sorted.sort_by(|a, b| {
-                            (b.width * b.height, b.width, b.fps_num * a.fps_den)
-                                .cmp(&(a.width * a.height, a.width, a.fps_num * b.fps_den))
-                        });
-                        let mut seen = Vec::new();
-                        for m in sorted {
-                            let key = (m.width, m.height, (m.fps() * 100.0) as u32);
-                            if seen.contains(&key) {
-                                continue;
-                            }
-                            seen.push(key);
-                            let pref = ModePref { width: m.width, height: m.height, fps: m.fps() };
-                            let label = format!("{}x{} @ {:.2}", m.width, m.height, m.fps());
-                            ui.selectable_value(&mut d.video_mode, Some(pref), label);
+                    ui.label("Resolution");
+                    pickers::resolution_picker(ui, "settings", &mut d.video_mode, modes, current, 280.0);
+                    ui.end_row();
+
+                    ui.label("Frame rate");
+                    pickers::rate_picker(ui, "settings", &mut d.video_mode, modes, current, 280.0);
+                    ui.end_row();
+
+                    section(ui, "Encoding");
+                    ui.label("Codec");
+                    pickers::codec_picker(ui, "settings", &mut d.codec, false, 280.0);
+                    ui.end_row();
+                    ui.label("Bitrate");
+                    ui.horizontal(|ui| {
+                        let mut auto = d.bitrate_mbps == 0;
+                        if ui.checkbox(&mut auto, "Auto").changed() {
+                            d.bitrate_mbps = if auto { 0 } else { 50 };
+                        }
+                        if !auto {
+                            ui.add(egui::Slider::new(&mut d.bitrate_mbps, 5..=150).suffix(" Mbps"));
                         }
                     });
                     ui.end_row();
@@ -77,30 +87,12 @@ impl SettingsUi {
                     optional_combo(ui, "audio_out", &mut d.audio_output, &self.audio_outputs, "Windows default");
                     ui.end_row();
 
-                    section(ui, "Instant replay & recording");
+                    section(ui, "Instant replay & output");
                     ui.label("Instant replay");
                     ui.checkbox(&mut d.replay_enabled, "Keep a rolling buffer in RAM");
                     ui.end_row();
                     ui.label("Replay length");
                     ui.add(egui::Slider::new(&mut d.replay_seconds, 10..=600).suffix(" s"));
-                    ui.end_row();
-                    ui.label("Codec");
-                    egui::ComboBox::from_id_salt("codec").selected_text(d.codec.label()).show_ui(ui, |ui| {
-                        for c in Codec::ALL {
-                            ui.selectable_value(&mut d.codec, c, c.label());
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Bitrate");
-                    ui.horizontal(|ui| {
-                        let mut auto = d.bitrate_mbps == 0;
-                        if ui.checkbox(&mut auto, "Auto").changed() {
-                            d.bitrate_mbps = if auto { 0 } else { 50 };
-                        }
-                        if !auto {
-                            ui.add(egui::Slider::new(&mut d.bitrate_mbps, 5..=150).suffix(" Mbps"));
-                        }
-                    });
                     ui.end_row();
                     ui.label("Output folder");
                     let mut dir = d.output_dir.to_string_lossy().into_owned();

@@ -6,6 +6,7 @@ use eframe::egui::{self, Color32, RichText};
 use eframe::egui_wgpu;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+use super::pickers;
 use super::preview::{letterbox, PreviewCallback, PreviewRenderer};
 use super::settings::{SettingsOutcome, SettingsUi};
 use crate::config::Config;
@@ -93,9 +94,32 @@ impl App {
         ui.horizontal(|ui| {
             let device = st.device.lock().clone();
             let mode = *st.mode.lock();
+            let modes = st.modes.lock().clone();
+            let recording = st.recording_since.lock().is_some();
             ui.label(RichText::new(if device.is_empty() { "No device".into() } else { device }).strong());
-            if let Some(m) = mode {
-                ui.label(RichText::new(format!("{}x{} @ {:.0}", m.width, m.height, m.fps())).weak());
+
+            // Quick capture/encode switches; applied immediately (restarts the pipeline).
+            let mut pref = self.cfg.video_mode;
+            let mut codec = self.cfg.codec;
+            let changed = ui
+                .add_enabled_ui(!recording, |ui| {
+                    let mut c = pickers::resolution_picker(ui, "toolbar", &mut pref, &modes, mode, 120.0);
+                    c |= pickers::rate_picker(ui, "toolbar", &mut pref, &modes, mode, 92.0);
+                    c |= pickers::codec_picker(ui, "toolbar", &mut codec, true, 62.0);
+                    c
+                })
+                .inner;
+            if recording {
+                ui.label(RichText::new("🔒").weak()).on_hover_text("Stop recording to change resolution, frame rate or codec");
+            }
+            if changed {
+                let mut c = self.cfg.clone();
+                c.video_mode = pref;
+                c.codec = codec;
+                self.apply_settings(c);
+                if let Some(s) = self.settings.as_mut() {
+                    s.sync_capture(&self.cfg);
+                }
             }
             ui.separator();
 
@@ -106,7 +130,6 @@ impl App {
             {
                 self.pipeline.send(Command::SaveReplay);
             }
-            let recording = st.recording_since.lock().is_some();
             let rec_text = if recording {
                 RichText::new("⏹ Stop").color(REC_RED)
             } else {
@@ -288,7 +311,8 @@ impl eframe::App for App {
 
         if let Some(s) = self.settings.as_mut() {
             let modes = self.shared.status.modes.lock().clone();
-            match s.show(ctx, &modes, &self.hotkey_errors) {
+            let current = *self.shared.status.mode.lock();
+            match s.show(ctx, &modes, current, &self.hotkey_errors) {
                 SettingsOutcome::Open => {}
                 SettingsOutcome::Close => self.settings = None,
                 SettingsOutcome::Apply(cfg) => {
