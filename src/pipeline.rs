@@ -65,7 +65,10 @@ pub struct Status {
     pub color: Mutex<Option<ColorInfo>>,
     pub modes: Mutex<Vec<VideoMode>>,
     pub capturing: AtomicBool,
+    /// Frames per second arriving from the card (the signal refresh).
     pub fps_x100: AtomicU32,
+    /// Frames per second that differ from the previous one: what the game renders at.
+    pub game_fps_x100: AtomicU32,
     pub dropped_frames: AtomicU64,
     pub encoder: Mutex<String>,
     pub audio_in: Mutex<String>,
@@ -238,8 +241,7 @@ impl Session {
             let (stop, frame_tx) = (stop.clone(), frame_tx.clone());
             let (device, pref, chroma, range) = (cfg.video_device.clone(), cfg.video_mode, cfg.chroma, cfg.color_range);
             threads.push(spawn("video-capture", move || {
-                let mut fps_frames = 0u32;
-                let mut fps_since = Instant::now();
+                let mut rates = crate::game_fps::FrameRates::default();
                 video_mf::run_capture(
                     device,
                     pref,
@@ -261,18 +263,16 @@ impl Session {
                         Err(e) => {
                             sh_open.status.capturing.store(false, Ordering::Relaxed);
                             sh_open.status.fps_x100.store(0, Ordering::Relaxed);
+                            sh_open.status.game_fps_x100.store(0, Ordering::Relaxed);
                             sh_open.latest_frame.store(None);
                             sh_open.set_error(Some(format!("{e:#}")));
                         }
                     },
                     move |frame| {
-                        fps_frames += 1;
-                        let el = fps_since.elapsed();
-                        if el >= Duration::from_secs(1) {
-                            let fps = fps_frames as f64 / el.as_secs_f64();
-                            sh_frame.status.fps_x100.store((fps * 100.0) as u32, Ordering::Relaxed);
-                            fps_frames = 0;
-                            fps_since = Instant::now();
+                        if let Some(r) = rates.push(&frame) {
+                            let st = &sh_frame.status;
+                            st.fps_x100.store((r.signal * 100.0) as u32, Ordering::Relaxed);
+                            st.game_fps_x100.store((r.game * 100.0) as u32, Ordering::Relaxed);
                         }
                         sh_frame.latest_frame.store(Some(frame.clone()));
                         sh_frame.request_repaint();

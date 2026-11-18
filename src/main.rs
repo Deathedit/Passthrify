@@ -6,6 +6,7 @@ mod clock;
 mod color;
 mod config;
 mod encode;
+mod game_fps;
 mod hotkeys;
 mod mux;
 mod notify;
@@ -267,10 +268,11 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
             recorded = true;
         }
         println!(
-            "[{t:>3}s] {} | {:?} | {:.2} fps | dropped {} | replay {:.1}s {:.1} MB | {} | audio: {} | err: {:?}",
+            "[{t:>3}s] {} | {:?} | {:.2} fps (game {:.1}) | dropped {} | replay {:.1}s {:.1} MB | {} | audio: {} | err: {:?}",
             st.device.lock(),
             st.mode.lock().map(|m| m.to_string()),
             st.fps_x100.load(Ordering::Relaxed) as f64 / 100.0,
+            st.game_fps_x100.load(Ordering::Relaxed) as f64 / 100.0,
             st.dropped_frames.load(Ordering::Relaxed),
             st.replay_ms.load(Ordering::Relaxed) as f64 / 1000.0,
             st.replay_bytes.load(Ordering::Relaxed) as f64 / 1_048_576.0,

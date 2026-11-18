@@ -394,8 +394,18 @@ impl App {
                     );
                 });
             }
-            let fps = st.fps_x100.load(Ordering::Relaxed) as f32 / 100.0;
-            ui.label(text(format!("{fps:.1} fps")));
+            let signal = st.fps_x100.load(Ordering::Relaxed) as f32 / 100.0;
+            let game = st.game_fps_x100.load(Ordering::Relaxed) as f32 / 100.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new(format!("{game:.0} fps")).font(theme::mono(12.0)).color(theme::TEXT))
+                    .on_hover_text(
+                        "Game frame rate: captured frames that differ from the one before. \
+                         Reads low on still screens (menus, pause), where the image doesn't change.",
+                    );
+                ui.label(text(format!("· {signal:.1} Hz")))
+                    .on_hover_text("Signal refresh rate: frames per second arriving from the capture card");
+            });
             let dropped = st.dropped_frames.load(Ordering::Relaxed);
             if dropped > 0 {
                 ui.label(RichText::new(format!("{dropped} dropped")).font(theme::mono(12.0)).color(theme::WARNING));
