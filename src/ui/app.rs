@@ -105,10 +105,12 @@ impl App {
             let actual_chroma = *st.chroma.lock();
             let changed = ui
                 .add_enabled_ui(!recording, |ui| {
-                    let mut c = pickers::resolution_picker(ui, "toolbar", &mut pref, &modes, mode, 150.0);
-                    c |= pickers::rate_picker(ui, "toolbar", &mut pref, &modes, mode, 92.0);
-                    let av = pickers::available_for(&modes, pref.as_ref(), mode);
-                    c |= pickers::chroma_picker(ui, "toolbar", &mut chroma, &mut codec, &av, actual_chroma, 64.0);
+                    // Chroma first: it decides which resolutions / frame rates are offered.
+                    let mut c = pickers::chroma_picker(
+                        ui, "toolbar", &mut chroma, &mut pref, &mut codec, &modes, actual_chroma, 64.0,
+                    );
+                    c |= pickers::resolution_picker(ui, "toolbar", &mut pref, chroma, &modes, mode, 120.0);
+                    c |= pickers::rate_picker(ui, "toolbar", &mut pref, chroma, &modes, mode, 92.0);
                     c |= pickers::codec_picker(ui, "toolbar", &mut codec, chroma, true, 62.0);
                     c
                 })

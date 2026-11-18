@@ -1,4 +1,8 @@
-//! Resolution / frame-rate / codec dropdowns shared by the toolbar and the Settings window.
+//! Chroma / resolution / frame-rate / codec dropdowns shared by the toolbar and Settings.
+//!
+//! Chroma is the primary choice: the resolution and frame-rate lists only offer modes where
+//! the card natively delivers the selected chroma (4:2:0 = any mode, 4:2:2 = YUY2 modes,
+//! 4:4:4 = RGB24 modes).
 
 use eframe::egui;
 
@@ -17,54 +21,25 @@ pub fn fmt_fps(f: f64) -> String {
     }
 }
 
-/// Chroma formats the card can natively deliver at `w`x`h` (optionally at `fps`), ascending.
-/// 4:2:0 is always possible when any mode exists.
-pub fn available_chromas(modes: &[VideoMode], w: u32, h: u32, fps: Option<f64>) -> Vec<Chroma> {
-    let mut v: Vec<Chroma> = modes
-        .iter()
-        .filter(|m| m.format.supported() && m.width == w && m.height == h)
-        .filter(|m| fps.is_none_or(|f| (m.fps() - f).abs() < 0.5))
-        .map(|m| m.format.native_chroma())
-        .collect();
-    if !v.is_empty() {
-        v.push(Chroma::S420);
-    }
-    v.sort();
-    v.dedup();
-    v
+/// Can this mode deliver `chroma` natively?
+fn delivers(m: &VideoMode, chroma: Chroma) -> bool {
+    m.format.supported() && (chroma == Chroma::S420 || m.format.native_chroma() == chroma)
 }
 
-/// Chromas available for the mode selected in `pref`, or the running mode when on Auto.
-pub fn available_for(modes: &[VideoMode], pref: Option<&ModePref>, current: Option<VideoMode>) -> Vec<Chroma> {
-    match (pref, current) {
-        (Some(p), _) => available_chromas(modes, p.width, p.height, Some(p.fps)),
-        (None, Some(m)) => available_chromas(modes, m.width, m.height, Some(m.fps())),
-        _ => vec![Chroma::S420],
-    }
-}
-
-/// " · 4:4:4" style tag naming the best chroma above 4:2:0, if any.
-fn chroma_tag(av: &[Chroma]) -> String {
-    match av.last() {
-        Some(c) if *c > Chroma::S420 => format!("   {}", c.label()),
-        _ => String::new(),
-    }
-}
-
-/// Distinct capturable resolutions, highest first.
-pub fn resolutions(modes: &[VideoMode]) -> Vec<(u32, u32)> {
+/// Distinct resolutions that deliver `chroma`, highest first.
+pub fn resolutions(modes: &[VideoMode], chroma: Chroma) -> Vec<(u32, u32)> {
     let mut v: Vec<(u32, u32)> =
-        modes.iter().filter(|m| m.format.supported()).map(|m| (m.width, m.height)).collect();
+        modes.iter().filter(|m| delivers(m, chroma)).map(|m| (m.width, m.height)).collect();
     v.sort_by(|a, b| (b.0 * b.1, b.0).cmp(&(a.0 * a.1, a.0)));
     v.dedup();
     v
 }
 
-/// Distinct frame rates available at `w`x`h`, highest first.
-pub fn rates(modes: &[VideoMode], w: u32, h: u32) -> Vec<f64> {
+/// Distinct frame rates at `w`x`h` that deliver `chroma`, highest first.
+pub fn rates(modes: &[VideoMode], w: u32, h: u32, chroma: Chroma) -> Vec<f64> {
     let mut v: Vec<f64> = modes
         .iter()
-        .filter(|m| m.format.supported() && m.width == w && m.height == h)
+        .filter(|m| delivers(m, chroma) && m.width == w && m.height == h)
         .map(|m| m.fps())
         .collect();
     v.sort_by(|a, b| b.total_cmp(a));
@@ -72,12 +47,41 @@ pub fn rates(modes: &[VideoMode], w: u32, h: u32) -> Vec<f64> {
     v
 }
 
-/// Resolution dropdown. Picking a resolution keeps the current frame rate when that resolution
-/// offers it, otherwise falls back to the highest rate up to 60 Hz. Returns true on change.
+/// Keep `want` if offered, else the highest rate up to 60 Hz, else the highest.
+fn pick_fps(available: &[f64], want: f64) -> Option<f64> {
+    available
+        .iter()
+        .copied()
+        .find(|f| (f - want).abs() < 0.5)
+        .or_else(|| available.iter().copied().find(|f| *f <= 60.5))
+        .or(available.first().copied())
+}
+
+/// Moves a mode preference to the nearest mode that delivers `chroma`: same resolution and
+/// rate if possible, else same resolution at another rate, else the largest resolution that
+/// has it. `None` (Auto) stays Auto: capture then prefers modes with that chroma.
+pub fn fit_pref_to_chroma(modes: &[VideoMode], pref: Option<ModePref>, chroma: Chroma) -> Option<ModePref> {
+    let p = pref?;
+    let at_res = rates(modes, p.width, p.height, chroma);
+    if let Some(fps) = pick_fps(&at_res, p.fps) {
+        return Some(ModePref { fps, ..p });
+    }
+    for (w, h) in resolutions(modes, chroma) {
+        if let Some(fps) = pick_fps(&rates(modes, w, h, chroma), p.fps) {
+            return Some(ModePref { width: w, height: h, fps });
+        }
+    }
+    Some(p) // chroma not offered at all: leave it, capture falls back
+}
+
+/// Resolution dropdown (filtered by chroma). Picking a resolution keeps the current frame rate
+/// when available, otherwise the highest up to 60 Hz. Returns true on change.
+#[allow(clippy::too_many_arguments)]
 pub fn resolution_picker(
     ui: &mut egui::Ui,
     id: &str,
     pref: &mut Option<ModePref>,
+    chroma: Chroma,
     modes: &[VideoMode],
     current: Option<VideoMode>,
     width: f32,
@@ -93,19 +97,11 @@ pub fn resolution_picker(
             *pref = None;
             changed = true;
         }
-        for (w, h) in resolutions(modes) {
+        for (w, h) in resolutions(modes, chroma) {
             let selected = pref.is_some_and(|p| p.width == w && p.height == h);
-            let tag = chroma_tag(&available_chromas(modes, w, h, None));
-            if ui.selectable_label(selected, format!("{w}x{h}{tag}")).clicked() && !selected {
-                let available = rates(modes, w, h);
+            if ui.selectable_label(selected, format!("{w}x{h}")).clicked() && !selected {
                 let want = pref.map(|p| p.fps).or(current.map(|m| m.fps())).unwrap_or(60.0);
-                let fps = available
-                    .iter()
-                    .copied()
-                    .find(|f| (f - want).abs() < 0.5)
-                    .or_else(|| available.iter().copied().find(|f| *f <= 60.5))
-                    .or(available.first().copied())
-                    .unwrap_or(60.0);
+                let fps = pick_fps(&rates(modes, w, h, chroma), want).unwrap_or(60.0);
                 *pref = Some(ModePref { width: w, height: h, fps });
                 changed = true;
             }
@@ -114,11 +110,13 @@ pub fn resolution_picker(
     changed
 }
 
-/// Frame-rate dropdown for the selected (or currently captured) resolution.
+/// Frame-rate dropdown: only rates where the selected resolution delivers `chroma`.
+#[allow(clippy::too_many_arguments)]
 pub fn rate_picker(
     ui: &mut egui::Ui,
     id: &str,
     pref: &mut Option<ModePref>,
+    chroma: Chroma,
     modes: &[VideoMode],
     current: Option<VideoMode>,
     width: f32,
@@ -129,7 +127,7 @@ pub fn rate_picker(
         (None, Some(m)) => (m.width, m.height),
         (None, None) => (0, 0),
     };
-    let available = rates(modes, w, h);
+    let available = rates(modes, w, h, chroma);
     let text = match (pref.as_ref(), current) {
         (Some(p), _) => fmt_fps(p.fps),
         (None, Some(m)) => format!("Auto ({})", fmt_fps(m.fps())),
@@ -139,8 +137,7 @@ pub fn rate_picker(
         egui::ComboBox::from_id_salt(format!("{id}_fps")).selected_text(text).width(width).show_ui(ui, |ui| {
             for f in available {
                 let selected = pref.is_some_and(|p| fps_key(p.fps) == fps_key(f));
-                let tag = chroma_tag(&available_chromas(modes, w, h, Some(f)));
-                if ui.selectable_label(selected, format!("{}{tag}", fmt_fps(f))).clicked() && !selected {
+                if ui.selectable_label(selected, fmt_fps(f)).clicked() && !selected {
                     *pref = Some(ModePref { width: w, height: h, fps: f });
                     changed = true;
                 }
@@ -168,15 +165,16 @@ pub fn codec_picker(ui: &mut egui::Ui, id: &str, codec: &mut Codec, chroma: Chro
     changed
 }
 
-/// Chroma subsampling dropdown. `available` = what the selected mode can deliver; `actual` =
-/// what the running capture delivers. Picking 4:2:2/4:4:4 with AV1 switches the codec to HEVC.
+/// Chroma dropdown. Changing it moves `pref` to the nearest mode that delivers the new chroma
+/// and switches AV1 to HEVC for 4:2:2/4:4:4. `actual` = what the running capture delivers.
 #[allow(clippy::too_many_arguments)]
 pub fn chroma_picker(
     ui: &mut egui::Ui,
     id: &str,
     chroma: &mut Chroma,
+    pref: &mut Option<ModePref>,
     codec: &mut Codec,
-    available: &[Chroma],
+    modes: &[VideoMode],
     actual: Option<Chroma>,
     width: f32,
 ) -> bool {
@@ -187,18 +185,24 @@ pub fn chroma_picker(
     };
     let resp = egui::ComboBox::from_id_salt(format!("{id}_chroma")).selected_text(text).width(width).show_ui(ui, |ui| {
         for c in Chroma::ALL {
-            let here = available.contains(&c);
-            let label = if here { c.label().to_string() } else { format!("{}  (not at this mode)", c.label()) };
-            let hint = match c {
-                Chroma::S420 => "Smallest files, plays everywhere.",
-                Chroma::S422 => "Full vertical color. Captured as YUY2. Needs an RTX 50-series GPU to encode.",
-                Chroma::S444 => {
-                    "Full color resolution: crisp text, HUDs and red/blue edges. Captured as RGB \
-                     (on the 4K X up to 1440p60 / 1080p120)."
-                }
+            let top = resolutions(modes, c).first().copied();
+            let offered = modes.is_empty() || top.is_some();
+            let label = match top {
+                Some((w, h)) if c != Chroma::S420 => format!("{}   up to {w}x{h}", c.label()),
+                _ => c.label().to_string(),
             };
-            if ui.selectable_label(*chroma == c, label).on_hover_text(hint).clicked() && *chroma != c {
+            let hint = match c {
+                Chroma::S420 => "Smallest files, plays everywhere. All resolutions and frame rates.",
+                Chroma::S422 => "Full vertical color. Captured as YUY2. Needs an RTX 50-series GPU to encode.",
+                Chroma::S444 => "Full color resolution: crisp text, HUDs and red/blue edges. Captured as RGB.",
+            };
+            let resp = ui
+                .add_enabled(offered, egui::SelectableLabel::new(*chroma == c, label))
+                .on_hover_text(hint)
+                .on_disabled_hover_text("This capture device doesn't offer it");
+            if resp.clicked() && *chroma != c {
                 *chroma = c;
+                *pref = fit_pref_to_chroma(modes, *pref, c);
                 if !codec.supports(c) {
                     *codec = Codec::Hevc;
                 }
@@ -207,8 +211,8 @@ pub fn chroma_picker(
         }
     });
     resp.response.on_hover_text(
-        "Chroma subsampling. 4:2:2 / 4:4:4 files need VLC, mpv, MPC-HC or a pro editor; \
-         Windows' built-in player only decodes 4:2:0.",
+        "Chroma subsampling. The resolution and frame-rate lists show only modes that deliver it.\n\
+         4:2:2 / 4:4:4 files need VLC, mpv, MPC-HC or a pro editor; Windows' built-in player only decodes 4:2:0.",
     );
     changed
 }
@@ -222,39 +226,56 @@ mod tests {
         VideoMode { index: 0, width: w, height: h, fps_num: num, fps_den: den, format }
     }
 
-    #[test]
-    fn lists_are_sorted_and_deduped() {
-        let modes = [
-            m(1920, 1080, 60, 1, PixFmt::Nv12),
-            m(1920, 1080, 60, 1, PixFmt::Yuy2),
-            m(3840, 2160, 30, 1, PixFmt::Nv12),
-            m(3840, 2160, 60000, 1001, PixFmt::Nv12),
+    fn sample() -> Vec<VideoMode> {
+        vec![
+            m(3840, 2160, 144, 1, PixFmt::Nv12),
             m(3840, 2160, 60, 1, PixFmt::Nv12),
-            m(3440, 1440, 60, 1, PixFmt::Nv12),
+            m(3840, 2160, 60000, 1001, PixFmt::Nv12),
+            m(3840, 2160, 30, 1, PixFmt::Yuy2),
             m(2560, 1440, 144, 1, PixFmt::Nv12),
+            m(2560, 1440, 60, 1, PixFmt::Nv12),
+            m(2560, 1440, 60, 1, PixFmt::Yuy2),
+            m(2560, 1440, 60, 1, PixFmt::Rgb24),
+            m(2560, 1440, 30, 1, PixFmt::Rgb24),
+            m(1920, 1080, 240, 1, PixFmt::Nv12),
+            m(1920, 1080, 120, 1, PixFmt::Rgb24),
+            m(1920, 1080, 60, 1, PixFmt::Yuy2),
             m(1280, 720, 60, 1, PixFmt::P010), // unsupported format: hidden
-        ];
-        assert_eq!(resolutions(&modes), vec![(3840, 2160), (3440, 1440), (2560, 1440), (1920, 1080)]);
-        let r = rates(&modes, 3840, 2160);
-        assert_eq!(r.len(), 3);
-        assert_eq!(fmt_fps(r[0]), "60 Hz");
-        assert_eq!(fmt_fps(r[1]), "59.94 Hz");
-        assert_eq!(fmt_fps(r[2]), "30 Hz");
-        assert_eq!(rates(&modes, 1920, 1080).len(), 1);
+        ]
     }
 
     #[test]
-    fn chroma_availability() {
-        let modes = [
-            m(2560, 1440, 60, 1, PixFmt::Nv12),
-            m(2560, 1440, 60, 1, PixFmt::Rgb24),
-            m(2560, 1440, 30, 1, PixFmt::Yuy2),
-            m(3840, 2160, 60, 1, PixFmt::Nv12),
-        ];
-        assert_eq!(available_chromas(&modes, 2560, 1440, Some(60.0)), vec![Chroma::S420, Chroma::S444]);
-        assert_eq!(available_chromas(&modes, 2560, 1440, Some(30.0)), vec![Chroma::S420, Chroma::S422]);
-        assert_eq!(available_chromas(&modes, 2560, 1440, None), vec![Chroma::S420, Chroma::S422, Chroma::S444]);
-        assert_eq!(available_chromas(&modes, 3840, 2160, None), vec![Chroma::S420]);
-        assert!(available_chromas(&modes, 1280, 720, None).is_empty());
+    fn resolutions_follow_chroma() {
+        let modes = sample();
+        assert_eq!(resolutions(&modes, Chroma::S420), vec![(3840, 2160), (2560, 1440), (1920, 1080)]);
+        assert_eq!(resolutions(&modes, Chroma::S422), vec![(3840, 2160), (2560, 1440), (1920, 1080)]);
+        assert_eq!(resolutions(&modes, Chroma::S444), vec![(2560, 1440), (1920, 1080)]);
+    }
+
+    #[test]
+    fn rates_follow_chroma() {
+        let modes = sample();
+        let hz = |w, h, c| rates(&modes, w, h, c).into_iter().map(fmt_fps).collect::<Vec<_>>();
+        assert_eq!(hz(3840, 2160, Chroma::S420), ["144 Hz", "60 Hz", "59.94 Hz", "30 Hz"]);
+        assert_eq!(hz(3840, 2160, Chroma::S422), ["30 Hz"]);
+        assert!(hz(3840, 2160, Chroma::S444).is_empty());
+        assert_eq!(hz(2560, 1440, Chroma::S444), ["60 Hz", "30 Hz"]);
+        assert_eq!(hz(1920, 1080, Chroma::S444), ["120 Hz"]);
+        assert_eq!(hz(2560, 1440, Chroma::S420), ["144 Hz", "60 Hz", "30 Hz"]);
+    }
+
+    #[test]
+    fn switching_chroma_moves_to_a_valid_mode() {
+        let modes = sample();
+        let p = |w, h, fps| Some(ModePref { width: w, height: h, fps });
+        // 4K60 has no 4:4:4: jump to the largest 4:4:4 resolution, keeping 60 Hz.
+        assert_eq!(fit_pref_to_chroma(&modes, p(3840, 2160, 60.0), Chroma::S444), p(2560, 1440, 60.0));
+        // 1440p144 has no 4:4:4 at 144: same resolution, best rate up to 60.
+        assert_eq!(fit_pref_to_chroma(&modes, p(2560, 1440, 144.0), Chroma::S444), p(2560, 1440, 60.0));
+        // 4K60 -> 4:2:2: 4K only does 4:2:2 at 30.
+        assert_eq!(fit_pref_to_chroma(&modes, p(3840, 2160, 60.0), Chroma::S422), p(3840, 2160, 30.0));
+        // Already valid: unchanged. Auto stays Auto.
+        assert_eq!(fit_pref_to_chroma(&modes, p(1920, 1080, 120.0), Chroma::S444), p(1920, 1080, 120.0));
+        assert_eq!(fit_pref_to_chroma(&modes, None, Chroma::S444), None);
     }
 }

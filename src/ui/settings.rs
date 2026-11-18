@@ -57,19 +57,20 @@ impl SettingsUi {
                     optional_combo(ui, "video_dev", &mut d.video_device, &self.video_devices, "Auto (Elgato)");
                     ui.end_row();
 
+                    ui.label("Chroma");
+                    // Only show the "→ actual" hint when the draft matches what's running.
+                    let actual = actual_chroma.filter(|_| d.video_mode == self.applied_mode);
+                    pickers::chroma_picker(
+                        ui, "settings", &mut d.chroma, &mut d.video_mode, &mut d.codec, modes, actual, 280.0,
+                    );
+                    ui.end_row();
+
                     ui.label("Resolution");
-                    pickers::resolution_picker(ui, "settings", &mut d.video_mode, modes, current, 280.0);
+                    pickers::resolution_picker(ui, "settings", &mut d.video_mode, d.chroma, modes, current, 280.0);
                     ui.end_row();
 
                     ui.label("Frame rate");
-                    pickers::rate_picker(ui, "settings", &mut d.video_mode, modes, current, 280.0);
-                    ui.end_row();
-
-                    ui.label("Chroma");
-                    let av = pickers::available_for(modes, d.video_mode.as_ref(), current);
-                    // Only show the "→ actual" hint when the draft matches what's running.
-                    let actual = actual_chroma.filter(|_| d.video_mode == self.applied_mode);
-                    pickers::chroma_picker(ui, "settings", &mut d.chroma, &mut d.codec, &av, actual, 280.0);
+                    pickers::rate_picker(ui, "settings", &mut d.video_mode, d.chroma, modes, current, 280.0);
                     ui.end_row();
 
                     section(ui, "Encoding");
