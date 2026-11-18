@@ -6,6 +6,7 @@ use super::app::hotkey_parts;
 use super::pickers;
 use super::theme::{self, icons, Kind};
 use crate::capture::video_mf::VideoMode;
+use crate::color::{ColorInfo, RangePref};
 use crate::config::{Chroma, Codec, Config, PresentMode};
 
 pub enum SettingsOutcome {
@@ -93,6 +94,7 @@ impl SettingsUi {
         modes: &[VideoMode],
         current: Option<VideoMode>,
         actual_chroma: Option<Chroma>,
+        color: Option<ColorInfo>,
         hotkey_errors: &[String],
     ) -> SettingsOutcome {
         self.poll_hotkey_capture(ctx);
@@ -175,7 +177,7 @@ impl SettingsUi {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
                         match self.section {
-                            Section::Capture => self.capture_card(ui, modes, current, actual_chroma),
+                            Section::Capture => self.capture_card(ui, modes, current, actual_chroma, color),
                             Section::Audio => self.audio_card(ui),
                             Section::Replay => {
                                 if self.replay_card(ui, current, actual_chroma) {
@@ -217,7 +219,14 @@ impl SettingsUi {
         outcome
     }
 
-    fn capture_card(&mut self, ui: &mut egui::Ui, modes: &[VideoMode], current: Option<VideoMode>, actual: Option<Chroma>) {
+    fn capture_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        modes: &[VideoMode],
+        current: Option<VideoMode>,
+        actual: Option<Chroma>,
+        color: Option<ColorInfo>,
+    ) {
         let d = &mut self.draft;
         let applied = self.applied_mode;
         let devices = &self.video_devices;
@@ -245,6 +254,22 @@ impl SettingsUi {
                 RichText::new("Resolution and frame-rate lists only show modes that deliver the selected chroma.")
                     .size(12.0)
                     .color(theme::TEXT3),
+            );
+            ui.add_space(6.0);
+
+            theme::field_label(ui, "Input range");
+            egui::ComboBox::from_id_salt("s_range").selected_text(d.color_range.label()).width(w).show_ui(ui, |ui| {
+                for r in RangePref::ALL {
+                    ui.selectable_value(&mut d.color_range, r, r.label());
+                }
+            });
+            let detected = color.map(|c| c.label()).unwrap_or_else(|| "unknown".into());
+            ui.label(
+                RichText::new(format!(
+                    "Now: {detected}. Override only if blacks look grey (pick Full) or crushed (pick Limited)."
+                ))
+                .size(12.0)
+                .color(theme::TEXT3),
             );
         });
     }

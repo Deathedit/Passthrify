@@ -9,6 +9,7 @@ use ffmpeg_next as ff;
 
 use crate::capture::video_mf::VideoMode;
 use crate::capture::VideoFrame;
+use crate::color::{ColorInfo, Matrix};
 use crate::config::{Chroma, Codec};
 use crate::packets::{EncodedPacket, SendParams, StreamKind, StreamParams};
 
@@ -19,6 +20,9 @@ pub struct VideoEncoderConfig {
     pub codec: Codec,
     pub mode: VideoMode,
     pub chroma: Chroma,
+    /// Range + matrix of the incoming frames; written into the stream's VUI so players decode
+    /// it correctly (full-range NV12 tagged as limited looks crushed/dark in strict players).
+    pub color: ColorInfo,
     pub bitrate: u64,
 }
 
@@ -66,8 +70,16 @@ pub fn open(cfg: &VideoEncoderConfig) -> Result<ff::encoder::Video> {
     enc.set_flags(ff::codec::Flags::GLOBAL_HEADER);
     unsafe {
         let ctx = enc.as_mut_ptr();
-        (*ctx).color_range = ff::ffi::AVColorRange::AVCOL_RANGE_MPEG;
-        (*ctx).colorspace = ff::ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*ctx).color_range = if cfg.color.full_range {
+            ff::ffi::AVColorRange::AVCOL_RANGE_JPEG
+        } else {
+            ff::ffi::AVColorRange::AVCOL_RANGE_MPEG
+        };
+        (*ctx).colorspace = match cfg.color.matrix {
+            Matrix::Bt709 => ff::ffi::AVColorSpace::AVCOL_SPC_BT709,
+            Matrix::Bt601 => ff::ffi::AVColorSpace::AVCOL_SPC_SMPTE170M,
+        };
+        // Primaries / transfer stay BT.709: HDMI SDR content, only the YCbCr matrix differs.
         (*ctx).color_primaries = ff::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
         (*ctx).color_trc = ff::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         (*ctx).rc_buffer_size = cfg.bitrate as i32 * 2;
@@ -102,10 +114,11 @@ pub fn run(
     let mut enc = open(&cfg)?;
     *params.video.lock() = Some(SendParams(super::params_of(&enc)));
     tracing::info!(
-        "video encoder {} {} {} @ {:.1} Mbps (preset {})",
+        "video encoder {} {} {} {} @ {:.1} Mbps (preset {})",
         cfg.codec.nvenc_name(),
         cfg.mode,
         cfg.chroma.label(),
+        cfg.color.label(),
         cfg.bitrate as f64 / 1e6,
         preset_for(&cfg.mode)
     );

@@ -16,6 +16,8 @@ pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub chroma: Chroma,
+    /// YCbCr range + matrix of `data`.
+    pub color: crate::color::ColorInfo,
     pub data: PooledBuf,
     /// Arrival time on the session clock.
     pub pts_us: i64,

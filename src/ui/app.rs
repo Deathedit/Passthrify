@@ -323,6 +323,9 @@ impl App {
             let parts: Vec<&str> = enc.split_whitespace().collect();
             let enc = if parts.len() >= 4 { format!("{} · {} · {} {}", parts[0], parts[1], parts[2], parts[3]) } else { enc };
             ui.label(text(enc));
+            if let Some(c) = *st.color.lock() {
+                ui.label(text(c.label())).on_hover_text("Input YCbCr matrix and range (Settings > Capture to override)");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(text(format!("Audio: {}", st.audio_in.lock())));
             });
@@ -514,7 +517,8 @@ impl eframe::App for App {
             let modes = self.shared.status.modes.lock().clone();
             let current = *self.shared.status.mode.lock();
             let actual_chroma = *self.shared.status.chroma.lock();
-            match s.show(ctx, &modes, current, actual_chroma, &self.hotkey_errors) {
+            let color = *self.shared.status.color.lock();
+            match s.show(ctx, &modes, current, actual_chroma, color, &self.hotkey_errors) {
                 SettingsOutcome::Open => {}
                 SettingsOutcome::Close => self.settings = None,
                 SettingsOutcome::OpenFolder => self.pipeline.send(Command::OpenOutputFolder),

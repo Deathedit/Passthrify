@@ -11,6 +11,7 @@ use windows::Win32::System::Com::CoTaskMemFree;
 
 use super::{looks_like_elgato, Chroma, FramePool, VideoFrame};
 use crate::clock;
+use crate::color::{ColorInfo, RangePref};
 use crate::config::ModePref;
 
 const VIDEO_STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
@@ -200,6 +201,8 @@ pub struct VideoDevice {
     current: Option<(VideoMode, Chroma)>,
     /// MF_MT_DEFAULT_STRIDE of the current type (negative = bottom-up).
     default_stride: i32,
+    /// Range + matrix of the frames we hand out.
+    color: ColorInfo,
 }
 
 impl VideoDevice {
@@ -238,7 +241,7 @@ impl VideoDevice {
                 .with_context(|| format!("creating source reader for '{name}' (is another app using it?)"))?;
 
             let modes = enumerate_modes(&reader)?;
-            Ok(Self { name, modes, source, reader, current: None, default_stride: 0 })
+            Ok(Self { name, modes, source, reader, current: None, default_stride: 0, color: ColorInfo::default() })
         }
     }
 
@@ -247,7 +250,7 @@ impl VideoDevice {
         choose_mode(&self.modes, pref, chroma)
     }
 
-    pub fn set_mode(&mut self, mode: &VideoMode, chroma: Chroma) -> Result<()> {
+    pub fn set_mode(&mut self, mode: &VideoMode, chroma: Chroma, range: RangePref) -> Result<()> {
         unsafe {
             let mt = self.reader.GetNativeMediaType(VIDEO_STREAM, mode.index)?;
             self.reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
@@ -260,6 +263,19 @@ impl VideoDevice {
                 PixFmt::Yuy2 => 2,
                 _ => 1,
             };
+            // The 4K X reports NV12 as full-range BT.601 and YUY2 as limited BT.709 (verified
+            // against each other on real captures), so honor what the media type says.
+            let nominal = mt.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE).ok();
+            let matrix = mt.GetUINT32(&MF_MT_YUV_MATRIX).ok();
+            self.color = match mode.format {
+                // We convert full-range RGB to limited BT.709 ourselves.
+                PixFmt::Rgb24 => ColorInfo::default(),
+                _ => ColorInfo::from_mf(nominal, matrix, mode.height).with_range(range),
+            };
+            tracing::info!(
+                "media type: nominal_range={nominal:?} yuv_matrix={matrix:?} -> {} (range setting {range:?})",
+                self.color.label()
+            );
             // RGB types without an explicit stride are bottom-up by MF convention.
             let fallback = if mode.format == PixFmt::Rgb24 { -(mode.width as i32 * bpp) } else { mode.width as i32 * bpp };
             self.default_stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(fallback);
@@ -310,7 +326,15 @@ impl VideoDevice {
                 res?;
             }
 
-            Ok(Some(VideoFrame { width: mode.width, height: mode.height, chroma, data: out, pts_us, seq }))
+            Ok(Some(VideoFrame {
+                width: mode.width,
+                height: mode.height,
+                chroma,
+                color: self.color,
+                data: out,
+                pts_us,
+                seq,
+            }))
         }
     }
 }
@@ -539,8 +563,9 @@ pub fn run_capture(
     device: Option<String>,
     pref: Option<ModePref>,
     chroma: Chroma,
+    range: RangePref,
     stop: Arc<AtomicBool>,
-    mut on_open: impl FnMut(Result<(String, Vec<VideoMode>, VideoMode, Chroma)>),
+    mut on_open: impl FnMut(Result<(String, Vec<VideoMode>, VideoMode, Chroma, ColorInfo)>),
     mut on_frame: impl FnMut(Arc<VideoFrame>),
 ) {
     let _com = match super::ComGuard::new() {
@@ -560,7 +585,7 @@ pub fn run_capture(
             let (mode, out_chroma) = dev
                 .choose_mode(pref.as_ref(), chroma)
                 .ok_or_else(|| anyhow!("'{}' offers no NV12/YUY2/RGB24 modes: {:?}", dev.name, dev.modes))?;
-            dev.set_mode(&mode, out_chroma)?;
+            dev.set_mode(&mode, out_chroma, range)?;
             Ok(dev)
         })();
         let mut dev = match opened {
@@ -572,8 +597,8 @@ pub fn run_capture(
             }
         };
         let (mode, out_chroma) = dev.current.unwrap();
-        tracing::info!("capturing '{}' at {mode} -> {}", dev.name, out_chroma.label());
-        on_open(Ok((dev.name.clone(), dev.modes.clone(), mode, out_chroma)));
+        tracing::info!("capturing '{}' at {mode} -> {} {}", dev.name, out_chroma.label(), dev.color.label());
+        on_open(Ok((dev.name.clone(), dev.modes.clone(), mode, out_chroma, dev.color)));
 
         while !stop.load(Ordering::Relaxed) {
             match dev.read_frame(&pool, seq) {

@@ -115,6 +115,8 @@ pub struct Config {
     pub video_mode: Option<ModePref>,
     /// Desired chroma subsampling; falls back to what the chosen mode can deliver.
     pub chroma: Chroma,
+    /// Input YCbCr range; Auto trusts the capture device's media type.
+    pub color_range: crate::color::RangePref,
     /// Audio capture endpoint name substring; None = auto-match the capture card.
     pub audio_input: Option<String>,
     /// Audio render endpoint for passthrough; None = Windows default output.
@@ -148,6 +150,7 @@ impl Default for Config {
             video_device: None,
             video_mode: None,
             chroma: Chroma::S420,
+            color_range: crate::color::RangePref::Auto,
             audio_input: None,
             audio_output: None,
             passthrough_enabled: true,

@@ -6,11 +6,15 @@ use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu, CallbackResources, CallbackTrait, RenderState};
 
 use crate::capture::{Chroma, VideoFrame};
+use crate::color::ShaderParams;
 
 pub struct PreviewRenderer {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// `ColorParams` uniform (range + matrix of the current frames).
+    params: wgpu::Buffer,
+    params_set: Option<ShaderParams>,
     tex: Option<Textures>,
 }
 
@@ -53,6 +57,16 @@ impl PreviewRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -92,10 +106,25 @@ impl PreviewRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        rs.renderer.write().callback_resources.insert(PreviewRenderer { pipeline, layout, sampler, tex: None });
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nv12 color params"),
+            size: std::mem::size_of::<ShaderParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        rs.renderer
+            .write()
+            .callback_resources
+            .insert(PreviewRenderer { pipeline, layout, sampler, params, params_set: None, tex: None });
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, f: &VideoFrame) {
+        let wanted = f.color.shader_params();
+        if self.params_set != Some(wanted) {
+            let bytes: Vec<u8> = wanted.levels.iter().chain(wanted.coefs.iter()).flat_map(|v| v.to_le_bytes()).collect();
+            queue.write_buffer(&self.params, 0, &bytes);
+            self.params_set = Some(wanted);
+        }
         let (w, h) = (f.width, f.height);
         let (cw, ch) = f.chroma_size();
         if !self.tex.as_ref().is_some_and(|t| t.width == w && t.height == h && t.chroma == f.chroma) {
@@ -127,6 +156,7 @@ impl PreviewRenderer {
                         resource: wgpu::BindingResource::TextureView(&uv.create_view(&Default::default())),
                     },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: self.params.as_entire_binding() },
                 ],
             });
             self.tex = Some(Textures { width: w, height: h, chroma: f.chroma, y, uv, bind, seq: u64::MAX });

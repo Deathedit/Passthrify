@@ -3,6 +3,7 @@
 mod audio;
 mod capture;
 mod clock;
+mod color;
 mod config;
 mod encode;
 mod hotkeys;
