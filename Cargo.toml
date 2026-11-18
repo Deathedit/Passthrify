@@ -1,0 +1,63 @@
+[package]
+name = "passthrify"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency Elgato capture viewer with ShadowPlay-style instant replay"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+arc-swap = "1"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# UI
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+raw-window-handle = "0.6"
+
+# Media
+ffmpeg-next = "8.1"
+
+# Desktop integration
+global-hotkey = "0.6"
+tray-icon = "0.19"
+tauri-winrt-notification = "0.7"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+    "Win32_System_Console",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.dev]
+# Pixel loops (YUY2 conversion, screenshots) are unusably slow at opt-level 0.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

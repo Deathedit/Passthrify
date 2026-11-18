@@ -1,0 +1,6 @@
+/target
+/dist
+/third_party/ffmpeg
+*.mp4
+*.png
+!assets/*.png
