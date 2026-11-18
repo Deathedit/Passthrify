@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" role="img" aria-label="Passthrify">
+  <!-- 16px tray glyph, pixel-snapped: stem x3-6, bowl r4, lens r2.5, dot r1.5. Transparent background. -->
+  <path fill="#F2F4F7" d="M3 3H9A4 4 0 0 1 9 11H6V13H3ZM6.5 7A2.5 2.5 0 1 0 11.5 7A2.5 2.5 0 1 0 6.5 7Z"/>
+  <circle cx="9" cy="7" r="1.5" fill="#5BD3FF"/>
+</svg>

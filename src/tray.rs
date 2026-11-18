@@ -16,28 +16,50 @@ pub struct Tray {
     _icon: TrayIcon,
 }
 
-pub fn icon_rgba(size: u32) -> Vec<u8> {
-    // Red record dot with a soft white ring.
-    let mut px = vec![0u8; (size * size * 4) as usize];
-    let c = (size as f32 - 1.0) / 2.0;
-    for y in 0..size {
-        for x in 0..size {
-            let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt() / c;
-            let i = ((y * size + x) * 4) as usize;
-            let (rgb, a) = if d <= 0.62 {
-                ([230, 40, 50], 255)
-            } else if d <= 0.8 {
-                ([20, 20, 24], 255)
-            } else if d <= 1.0 {
-                ([235, 235, 240], 255)
-            } else {
-                ([0, 0, 0], 0)
-            };
-            px[i..i + 3].copy_from_slice(&rgb);
-            px[i + 3] = a;
+/// "Lens P" on its dark tile (window / taskbar / exe icon).
+const MARK_SVG: &[u8] = include_bytes!("../assets/logo/passthrify-mark.svg");
+/// Pixel-snapped 16 px glyph for the notification area.
+const TRAY_SVG: &[u8] = include_bytes!("../assets/logo/passthrify-tray-16.svg");
+
+/// App icon as straight RGBA, `size`x`size`.
+pub fn app_icon_rgba(size: u32) -> Vec<u8> {
+    crate::svg_raster::rasterize(MARK_SVG, size, size).unwrap_or_else(|e| {
+        tracing::warn!("app icon: {e}");
+        vec![0; (size * size * 4) as usize]
+    })
+}
+
+/// Tray glyph rendered at 2x (32 px) so it stays crisp at 125-200% scaling.
+fn tray_icon_rgba() -> (Vec<u8>, u32) {
+    let size = 32;
+    let rgba = crate::svg_raster::rasterize(TRAY_SVG, size, size).unwrap_or_else(|_| app_icon_rgba(size));
+    (rgba, size)
+}
+
+/// Dark title bar; on Windows 11 also paints the caption in the app's base color.
+pub fn style_title_bar(hwnd: isize) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    if hwnd == 0 {
+        return;
+    }
+    let h = HWND(hwnd as *mut _);
+    // COLORREF is 0x00BBGGRR.
+    let colorref = |c: eframe::egui::Color32| u32::from(c.r()) | (u32::from(c.g()) << 8) | (u32::from(c.b()) << 16);
+    unsafe {
+        let on: i32 = 1;
+        let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &on as *const _ as *const _, 4);
+        for (attr, color) in [
+            (DWMWA_CAPTION_COLOR, crate::ui::theme::BASE),
+            (DWMWA_TEXT_COLOR, crate::ui::theme::TEXT2),
+            (DWMWA_BORDER_COLOR, crate::ui::theme::LINE),
+        ] {
+            let c = colorref(color);
+            let _ = DwmSetWindowAttribute(h, attr, &c as *const _ as *const _, 4);
         }
     }
-    px
 }
 
 pub fn toggle_window(hwnd: isize) {
@@ -78,7 +100,8 @@ pub fn create(hwnd: isize, cmd: Sender<Command>) -> Result<Tray> {
         &quit,
     ])?;
 
-    let icon = tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32)?;
+    let (rgba, size) = tray_icon_rgba();
+    let icon = tray_icon::Icon::from_rgba(rgba, size, size)?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Passthrify")

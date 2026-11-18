@@ -88,6 +88,17 @@ WASAPI capture ─┬─► passthrough ring ─► WASAPI render
   always starts on a keyframe (1 s GOP). Saving a replay just remuxes, with no re-encode.
 - Recordings are fragmented MP4: a crash leaves a playable file.
 
+## Design
+
+- **Logo:** "Lens P" in `assets/logo/` (SVG). build.rs renders `passthrify-mark.svg` into the
+  exe's multi-size icon. The app renders it at runtime for the window/taskbar, and
+  `passthrify-tray-16.svg` (pixel-snapped) for the tray.
+- **Theme:** `src/ui/theme.rs` holds the palette (signal cyan `#5BD3FF`, rec red `#FF4D5E`,
+  surfaces `#08090C`–`#1A1E25`), egui visuals, line icons and styled widgets.
+- **Fonts:** Inter (UI) and JetBrains Mono (numbers, timers) in `assets/fonts/`, embedded in
+  the binary. Both are SIL OFL 1.1; the licenses ship next to the exe.
+- `PASSTHRIFY_SETTINGS=capture|audio|replay|hotkeys|display` opens Settings on launch.
+
 ## Not yet supported
 
 - HDR (P010) capture/encode. Use SDR output, or let the card tone-map.

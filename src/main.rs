@@ -13,6 +13,7 @@ mod pipeline;
 mod recorder;
 mod replay;
 mod screenshot;
+mod svg_raster;
 mod tray;
 mod ui;
 
@@ -100,7 +101,7 @@ fn run_gui() -> Result<()> {
             .with_title("Passthrify")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([480.0, 300.0])
-            .with_icon(Arc::new(egui::IconData { rgba: tray::icon_rgba(64), width: 64, height: 64 })),
+            .with_icon(Arc::new(egui::IconData { rgba: tray::app_icon_rgba(128), width: 128, height: 128 })),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             present_mode,
             desired_maximum_frame_latency: Some(1),

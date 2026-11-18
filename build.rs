@@ -3,9 +3,52 @@
 
 use std::{env, fs, path::PathBuf};
 
+#[path = "src/svg_raster.rs"]
+mod svg_raster;
+
+const ICON_SVG: &str = "assets/logo/passthrify-mark.svg";
+
+/// Renders the logo into a multi-size .ico and embeds it (plus version info) in the exe.
+fn embed_icon() {
+    println!("cargo:rerun-if-changed={ICON_SVG}");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let svg = match fs::read(ICON_SVG) {
+        Ok(s) => s,
+        Err(e) => return println!("cargo:warning=icon: can't read {ICON_SVG}: {e}"),
+    };
+    let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+    for size in [16u32, 20, 24, 32, 40, 48, 64, 128, 256] {
+        match svg_raster::rasterize(&svg, size, size) {
+            Ok(rgba) => {
+                let img = ico::IconImage::from_rgba_data(size, size, rgba);
+                match ico::IconDirEntry::encode(&img) {
+                    Ok(entry) => dir.add_entry(entry),
+                    Err(e) => println!("cargo:warning=icon {size}px: {e}"),
+                }
+            }
+            Err(e) => println!("cargo:warning=icon {size}px: {e}"),
+        }
+    }
+    let ico_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("passthrify.ico");
+    if let Err(e) = fs::File::create(&ico_path).and_then(|f| dir.write(f)) {
+        return println!("cargo:warning=icon: writing {}: {e}", ico_path.display());
+    }
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon(ico_path.to_str().unwrap());
+    res.set("ProductName", "Passthrify");
+    res.set("FileDescription", "Passthrify - capture viewer with instant replay");
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=icon: embedding resources failed ({e}); exe will use the default icon");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/svg_raster.rs");
+    embed_icon();
 
     let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") else {
         println!("cargo:warning=FFMPEG_DIR not set; FFmpeg DLLs will not be copied");

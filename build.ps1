@@ -119,6 +119,8 @@ Copy-Item (Join-Path $Root 'target\release\passthrify.exe') $dist
 Get-ChildItem (Join-Path $FfmpegDir 'bin') -Filter '*.dll' | Copy-Item -Destination $dist
 Copy-Item (Join-Path $Root 'README.md') $dist
 Copy-Item (Join-Path $FfmpegDir 'LICENSE.txt') (Join-Path $dist 'FFMPEG-LICENSE.txt') -ErrorAction SilentlyContinue
+# Inter and JetBrains Mono are embedded in the exe; their OFL licenses must travel with it.
+Get-ChildItem (Join-Path $Root 'assets\fonts') -Filter 'OFL-*.txt' | Copy-Item -Destination $dist
 
 $sizeMb = [math]::Round(((Get-ChildItem $dist | Measure-Object Length -Sum).Sum / 1MB), 1)
 Write-Host "  dist\Passthrify  ($sizeMb MB, v$version)"

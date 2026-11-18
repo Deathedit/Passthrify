@@ -21,6 +21,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 # UI
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui_extras = { version = "0.31", default-features = false, features = ["svg"] }
+resvg = "0.37"
 raw-window-handle = "0.6"
 
 # Media
@@ -49,7 +51,14 @@ features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
 ]
+
+[build-dependencies]
+# Render assets/logo/passthrify-mark.svg into a multi-size .ico and embed it in the exe.
+resvg = "0.37"
+ico = "0.4"
+winresource = "0.1"
 
 [profile.dev]
 # Pixel loops (YUY2 conversion, screenshots) are unusably slow at opt-level 0.
