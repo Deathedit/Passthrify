@@ -1,0 +1,648 @@
+//! Self-updater backed by GitHub Releases.
+//!
+//! 1. `check`: list the repo's releases, pick the newest one allowed by the channel
+//!    (Stable = normal releases only, Pre-release = also pre-releases) that is newer than us.
+//! 2. `download_and_stage`: download `Passthrify-<ver>.zip`, verify it against the release's
+//!    `.sha256` asset, extract it to a temp folder.
+//! 3. `launch_installer`: run the *new* exe from the temp folder with `--apply-update`; it
+//!    waits for this process to exit, copies itself over the install folder and relaunches.
+//!    No separate updater binary, and nothing ever overwrites a running exe.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use parking_lot::Mutex;
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Repo baked in by the release workflow (`owner/name`); `update_repo` in config overrides it.
+const BUILT_IN_REPO: Option<&str> = option_env!("PASSTHRIFY_REPO");
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UpdateChannel {
+    /// Normal releases only.
+    #[default]
+    #[serde(rename = "stable")]
+    Stable,
+    /// Also pre-releases (betas, release candidates).
+    #[serde(rename = "prerelease")]
+    PreRelease,
+}
+
+impl UpdateChannel {
+    pub fn label(self) -> &'static str {
+        match self {
+            UpdateChannel::Stable => "Stable",
+            UpdateChannel::PreRelease => "Pre-release",
+        }
+    }
+}
+
+pub fn current_version() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("valid crate version")
+}
+
+/// `owner/name` to check, if any.
+pub fn repo(config_override: Option<&str>) -> Option<String> {
+    config_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(BUILT_IN_REPO.filter(|s| !s.is_empty()))
+        .map(|s| s.trim_start_matches("https://github.com/").trim_matches('/').to_string())
+}
+
+// --- GitHub API ----------------------------------------------------------------------------
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct GhRelease {
+    pub tag_name: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub html_url: String,
+    #[serde(default)]
+    pub assets: Vec<GhAsset>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct GhAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// An installable release.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Release {
+    pub version: Version,
+    pub tag: String,
+    pub notes: String,
+    pub url: String,
+    pub prerelease: bool,
+    pub zip_name: String,
+    pub zip_url: String,
+    pub zip_size: u64,
+    pub sha_url: String,
+}
+
+fn version_of(tag: &str) -> Option<Version> {
+    Version::parse(tag.trim().trim_start_matches(['v', 'V'])).ok()
+}
+
+/// Newest release allowed by `channel` that is newer than `current` and ships the zip +
+/// checksum assets. Releases without those assets are skipped (e.g. a botched upload).
+pub fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Version) -> Option<Release> {
+    releases
+        .iter()
+        .filter(|r| !r.draft)
+        .filter_map(|r| version_of(&r.tag_name).map(|v| (v, r)))
+        .filter(|(v, r)| match channel {
+            UpdateChannel::Stable => !r.prerelease && v.pre.is_empty(),
+            UpdateChannel::PreRelease => true,
+        })
+        .filter(|(v, _)| v > current)
+        .filter_map(|(v, r)| {
+            let zip_name = format!("Passthrify-{}.zip", r.tag_name.trim_start_matches(['v', 'V']));
+            let zip = r.assets.iter().find(|a| a.name == zip_name)?;
+            let sha = r.assets.iter().find(|a| a.name == format!("{zip_name}.sha256"))?;
+            let prerelease = r.prerelease || !v.pre.is_empty();
+            Some(Release {
+                version: v,
+                tag: r.tag_name.clone(),
+                notes: r.body.clone().unwrap_or_default(),
+                url: r.html_url.clone(),
+                prerelease,
+                zip_name,
+                zip_url: zip.browser_download_url.clone(),
+                zip_size: zip.size,
+                sha_url: sha.browser_download_url.clone(),
+            })
+        })
+        .max_by(|a, b| a.version.cmp(&b.version))
+}
+
+fn agent() -> Result<ureq::Agent> {
+    let tls = native_tls::TlsConnector::new().context("initializing TLS")?;
+    Ok(ureq::AgentBuilder::new()
+        .tls_connector(Arc::new(tls))
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .user_agent(&format!("Passthrify/{} (+updater)", env!("CARGO_PKG_VERSION")))
+        .build())
+}
+
+pub fn fetch_releases(repo: &str) -> Result<Vec<GhRelease>> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=30");
+    match agent()?.get(&url).set("Accept", "application/vnd.github+json").call() {
+        Ok(resp) => resp.into_json().context("parsing GitHub releases"),
+        Err(ureq::Error::Status(404, _)) => bail!("repository '{repo}' not found (or private)"),
+        Err(ureq::Error::Status(403, _)) => bail!("GitHub rate limit reached; try again later"),
+        Err(e) => Err(anyhow!("contacting GitHub: {e}")),
+    }
+}
+
+/// Ok(None) = up to date.
+pub fn check(repo: &str, channel: UpdateChannel) -> Result<Option<Release>> {
+    let releases = fetch_releases(repo)?;
+    Ok(pick_release(&releases, channel, &current_version()))
+}
+
+// --- Download + stage ----------------------------------------------------------------------
+
+fn staging_root() -> PathBuf {
+    std::env::temp_dir().join("passthrify-update")
+}
+
+/// Parses "<64 hex>  filename" (or just the hash).
+fn parse_sha256(text: &str) -> Result<String> {
+    let hash = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("checksum file is malformed");
+    }
+    Ok(hash)
+}
+
+/// Finds the folder holding passthrify.exe: the extraction root or its single subfolder
+/// (the release zip contains a top-level `Passthrify/` folder).
+fn find_app_dir(root: &Path) -> Result<PathBuf> {
+    if root.join("passthrify.exe").is_file() {
+        return Ok(root.to_path_buf());
+    }
+    for entry in std::fs::read_dir(root)?.flatten() {
+        let p = entry.path();
+        if p.is_dir() && p.join("passthrify.exe").is_file() {
+            return Ok(p);
+        }
+    }
+    bail!("update package doesn't contain passthrify.exe")
+}
+
+/// Downloads, verifies and extracts `rel`. Returns the folder containing the new exe.
+pub fn download_and_stage(rel: &Release, progress: impl Fn(f32)) -> Result<PathBuf> {
+    let agent = agent()?;
+    let dir = staging_root().join(rel.version.to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    let expected = {
+        let text = agent.get(&rel.sha_url).call().map_err(|e| anyhow!("downloading checksum: {e}"))?.into_string()?;
+        parse_sha256(&text)?
+    };
+
+    let resp = agent.get(&rel.zip_url).call().map_err(|e| anyhow!("downloading update: {e}"))?;
+    let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(rel.zip_size).max(1);
+    let zip_path = dir.join(&rel.zip_name);
+    let mut file = std::fs::File::create(&zip_path)?;
+    let mut reader = resp.into_reader();
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut done = 0u64;
+    loop {
+        let n = reader.read(&mut buf).context("downloading update")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n])?;
+        done += n as u64;
+        progress((done as f32 / total as f32).min(1.0));
+    }
+    file.flush()?;
+    drop(file);
+
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected {
+        let _ = std::fs::remove_dir_all(&dir);
+        bail!("update download is corrupted (checksum mismatch); nothing was installed");
+    }
+
+    let extract = dir.join("extracted");
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path)?).context("opening update package")?;
+    archive.extract(&extract).context("extracting update package")?;
+    find_app_dir(&extract)
+}
+
+/// Why self-install isn't possible here, if it isn't.
+pub fn install_blocker() -> Option<String> {
+    if cfg!(debug_assertions) {
+        return Some("Development build: install releases from GitHub instead.".into());
+    }
+    let dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        Some(d) => d,
+        None => return Some("Can't determine the install folder.".into()),
+    };
+    let probe = dir.join(".passthrify-write-test");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            None
+        }
+        Err(_) => Some(format!("{} isn't writable; update manually or move Passthrify to a user folder.", dir.display())),
+    }
+}
+
+/// Starts the staged exe as installer. The caller must then exit promptly.
+pub fn launch_installer(staged: &Path, version: &Version) -> Result<()> {
+    let install_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow!("no install folder"))?
+        .to_path_buf();
+    std::process::Command::new(staged.join("passthrify.exe"))
+        .arg("--apply-update")
+        .arg("--from")
+        .arg(staged)
+        .arg("--to")
+        .arg(&install_dir)
+        .arg("--pid")
+        .arg(std::process::id().to_string())
+        .arg("--version")
+        .arg(version.to_string())
+        .current_dir(staged)
+        .spawn()
+        .context("starting the installer")?;
+    Ok(())
+}
+
+// --- Installer mode (runs from the staged copy) ---------------------------------------------
+
+fn result_file() -> PathBuf {
+    crate::config::Config::data_dir().join("update-result.txt")
+}
+
+/// After a restart: Some((ok, message)) describing the last update attempt, once.
+pub fn take_update_result() -> Option<(bool, String)> {
+    let path = result_file();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let (status, msg) = text.split_once('\n').unwrap_or((text.as_str(), ""));
+    Some((status.trim() == "ok", msg.trim().to_string()))
+}
+
+fn wait_for_exit(pid: u32, timeout: Duration) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            WaitForSingleObject(h, timeout.as_millis() as u32);
+            let _ = CloseHandle(h);
+        }
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<usize> {
+    let mut n = 0;
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            n += copy_tree(&src, &dst)?;
+            continue;
+        }
+        // Antivirus scanners or a slow exit can hold files briefly: retry for ~10 s.
+        let mut attempt = 0;
+        loop {
+            match std::fs::copy(&src, &dst) {
+                Ok(_) => break,
+                Err(e) if attempt < 40 => {
+                    attempt += 1;
+                    if attempt == 1 {
+                        tracing::warn!("copy {} failed ({e}); retrying", dst.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => return Err(e).with_context(|| format!("replacing {}", dst.display())),
+            }
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Entry point for `passthrify --apply-update --from DIR --to DIR --pid N --version V`.
+pub fn apply_update_main(args: &[String]) -> Result<()> {
+    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let from = PathBuf::from(arg("--from").ok_or_else(|| anyhow!("--from missing"))?);
+    let to = PathBuf::from(arg("--to").ok_or_else(|| anyhow!("--to missing"))?);
+    let pid: u32 = arg("--pid").and_then(|p| p.parse().ok()).unwrap_or(0);
+    let version = arg("--version").unwrap_or_default();
+
+    if from == to {
+        bail!("refusing to install over the staging folder");
+    }
+    if pid != 0 {
+        wait_for_exit(pid, Duration::from_secs(60));
+    }
+    let result = copy_tree(&from, &to);
+    let (status, msg) = match &result {
+        Ok(n) => {
+            tracing::info!("update {version}: replaced {n} files in {}", to.display());
+            ("ok", format!("Updated to Passthrify {version}"))
+        }
+        Err(e) => {
+            tracing::error!("update {version} failed: {e:#}");
+            ("error", format!("Update to {version} failed: {e:#}"))
+        }
+    };
+    let _ = std::fs::create_dir_all(crate::config::Config::data_dir());
+    let _ = std::fs::write(result_file(), format!("{status}\n{msg}\n"));
+
+    // Relaunch whatever is in the install folder now (new on success, old on failure).
+    std::process::Command::new(to.join("passthrify.exe"))
+        .current_dir(&to)
+        .spawn()
+        .context("relaunching Passthrify")?;
+    result.map(|_| ())
+}
+
+// --- Background state for the UI ------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate { checked: String },
+    Available(Release),
+    Downloading { release: Release, progress: f32 },
+    /// Installer launched; the app should close.
+    Restarting,
+    Error(String),
+}
+
+pub struct Updater {
+    state: Mutex<UpdateState>,
+    repaint: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Updater {
+    pub fn new(repaint: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(UpdateState::Idle), repaint: Box::new(repaint) })
+    }
+
+    pub fn state(&self) -> UpdateState {
+        self.state.lock().clone()
+    }
+
+    fn set(&self, s: UpdateState) {
+        *self.state.lock() = s;
+        (self.repaint)();
+    }
+
+    pub fn busy(&self) -> bool {
+        matches!(*self.state.lock(), UpdateState::Checking | UpdateState::Downloading { .. } | UpdateState::Restarting)
+    }
+
+    /// Checks in the background (after `delay`).
+    pub fn start_check(self: &Arc<Self>, repo: Option<String>, channel: UpdateChannel, delay: Duration) {
+        if self.busy() {
+            return;
+        }
+        let Some(repo) = repo else {
+            return; // self-built copy without an update source: nothing to check
+        };
+        self.set(UpdateState::Checking);
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                let next = match check(&repo, channel) {
+                    Ok(Some(rel)) => {
+                        tracing::info!("update available: {} ({:?} channel)", rel.tag, channel);
+                        UpdateState::Available(rel)
+                    }
+                    Ok(None) => UpdateState::UpToDate { checked: chrono::Local::now().format("%H:%M").to_string() },
+                    Err(e) => {
+                        tracing::warn!("update check failed: {e:#}");
+                        UpdateState::Error(format!("{e:#}"))
+                    }
+                };
+                me.set(next);
+            })
+            .ok();
+    }
+
+    /// Downloads, verifies, stages and launches the installer in the background.
+    pub fn start_install(self: &Arc<Self>, rel: Release) {
+        if self.busy() {
+            return;
+        }
+        self.set(UpdateState::Downloading { release: rel.clone(), progress: 0.0 });
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("update-install".into())
+            .spawn(move || {
+                let staged = download_and_stage(&rel, |p| {
+                    if let UpdateState::Downloading { progress, .. } = &mut *me.state.lock() {
+                        *progress = p;
+                    }
+                    (me.repaint)();
+                });
+                let res = staged.and_then(|dir| launch_installer(&dir, &rel.version));
+                match res {
+                    Ok(()) => me.set(UpdateState::Restarting),
+                    Err(e) => {
+                        tracing::error!("update install failed: {e:#}");
+                        me.set(UpdateState::Error(format!("{e:#}")));
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rel(tag: &str, prerelease: bool, with_assets: bool) -> GhRelease {
+        let ver = tag.trim_start_matches('v');
+        let assets = if with_assets {
+            vec![
+                GhAsset { name: format!("Passthrify-{ver}.zip"), browser_download_url: format!("https://x/{ver}.zip"), size: 10 },
+                GhAsset {
+                    name: format!("Passthrify-{ver}.zip.sha256"),
+                    browser_download_url: format!("https://x/{ver}.sha256"),
+                    size: 1,
+                },
+            ]
+        } else {
+            vec![]
+        };
+        GhRelease {
+            tag_name: tag.into(),
+            body: Some(format!("notes {tag}")),
+            prerelease,
+            draft: false,
+            html_url: format!("https://github.com/o/r/releases/tag/{tag}"),
+            assets,
+        }
+    }
+
+    fn v(s: &str) -> Version {
+        Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn channels_pick_the_right_release() {
+        let releases = [
+            rel("v0.3.0-beta.1", true, true),
+            rel("v0.2.0", false, true),
+            rel("v0.1.0", false, true),
+        ];
+        let stable = pick_release(&releases, UpdateChannel::Stable, &v("0.1.0")).unwrap();
+        assert_eq!(stable.tag, "v0.2.0");
+        assert!(!stable.prerelease);
+        let pre = pick_release(&releases, UpdateChannel::PreRelease, &v("0.1.0")).unwrap();
+        assert_eq!(pre.tag, "v0.3.0-beta.1");
+        assert!(pre.prerelease);
+        assert_eq!(pre.zip_name, "Passthrify-0.3.0-beta.1.zip");
+        assert_eq!(pre.sha_url, "https://x/0.3.0-beta.1.sha256");
+    }
+
+    #[test]
+    fn never_offers_downgrades_or_same_version() {
+        let releases = [rel("v0.2.0", false, true), rel("v0.1.0", false, true)];
+        assert!(pick_release(&releases, UpdateChannel::Stable, &v("0.2.0")).is_none());
+        // On a beta newer than the latest stable: stable channel offers nothing.
+        assert!(pick_release(&releases, UpdateChannel::Stable, &v("0.3.0-beta.1")).is_none());
+        // ...but the final release of that beta is an upgrade.
+        let releases = [rel("v0.3.0", false, true)];
+        assert_eq!(pick_release(&releases, UpdateChannel::Stable, &v("0.3.0-beta.1")).unwrap().tag, "v0.3.0");
+    }
+
+    #[test]
+    fn skips_drafts_mislabelled_and_incomplete_releases() {
+        let mut draft = rel("v0.5.0", false, true);
+        draft.draft = true;
+        let unflagged_beta = rel("v0.4.0-rc.1", false, true); // semver pre-release, not flagged
+        let no_assets = rel("v0.3.0", false, false);
+        let garbage = rel("nightly", false, true);
+        let ok = rel("v0.2.0", false, true);
+        let releases = [draft, unflagged_beta, no_assets, garbage, ok];
+        assert_eq!(pick_release(&releases, UpdateChannel::Stable, &v("0.1.0")).unwrap().tag, "v0.2.0");
+        assert_eq!(pick_release(&releases, UpdateChannel::PreRelease, &v("0.1.0")).unwrap().tag, "v0.4.0-rc.1");
+    }
+
+    #[test]
+    fn parses_checksums_and_repos() {
+        let h = "a".repeat(64);
+        assert_eq!(parse_sha256(&format!("{h}  Passthrify-0.1.0.zip\r\n")).unwrap(), h);
+        assert!(parse_sha256("nope").is_err());
+        assert_eq!(repo(Some("https://github.com/me/Passthrify/")).as_deref(), Some("me/Passthrify"));
+        assert_eq!(repo(Some("  ")), repo(None));
+    }
+
+    /// Serves `files` (path -> body) over HTTP on localhost for `requests` requests.
+    fn serve(files: Vec<(&'static str, Vec<u8>)>, requests: usize) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(requests) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                loop {
+                    let mut l = String::new();
+                    if reader.read_line(&mut l).unwrap() == 0 || l == "\r\n" {
+                        break;
+                    }
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = files.iter().find(|(p, _)| *p == path).map(|(_, b)| b.clone());
+                let (status, body) = match body {
+                    Some(b) => ("200 OK", b),
+                    None => ("404 Not Found", Vec::new()),
+                };
+                let head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn test_zip() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            z.add_directory("Passthrify/", opts).unwrap();
+            z.start_file("Passthrify/passthrify.exe", opts).unwrap();
+            z.write_all(b"new exe").unwrap();
+            z.start_file("Passthrify/avcodec-62.dll", opts).unwrap();
+            z.write_all(&vec![7u8; 100_000]).unwrap();
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn release_at(base: &str, ver: &str) -> Release {
+        Release {
+            version: v(ver),
+            tag: format!("v{ver}"),
+            notes: String::new(),
+            url: String::new(),
+            prerelease: false,
+            zip_name: format!("Passthrify-{ver}.zip"),
+            zip_url: format!("{base}/pkg.zip"),
+            zip_size: 0,
+            sha_url: format!("{base}/pkg.zip.sha256"),
+        }
+    }
+
+    #[test]
+    fn downloads_verifies_and_extracts() {
+        let zip = test_zip();
+        let sha = format!("{:x}  Passthrify-9.9.1.zip\n", Sha256::digest(&zip));
+        let base = serve(vec![("/pkg.zip.sha256", sha.into_bytes()), ("/pkg.zip", zip)], 2);
+        let progress = std::sync::Mutex::new(Vec::new());
+        let dir = download_and_stage(&release_at(&base, "9.9.1"), |p| progress.lock().unwrap().push(p)).unwrap();
+        assert_eq!(std::fs::read(dir.join("passthrify.exe")).unwrap(), b"new exe");
+        assert!(dir.join("avcodec-62.dll").is_file());
+        assert_eq!(*progress.lock().unwrap().last().unwrap(), 1.0);
+        let _ = std::fs::remove_dir_all(staging_root().join("9.9.1"));
+    }
+
+    #[test]
+    fn rejects_tampered_downloads() {
+        let zip = test_zip();
+        let wrong = format!("{}  Passthrify-9.9.2.zip\n", "0".repeat(64));
+        let base = serve(vec![("/pkg.zip.sha256", wrong.into_bytes()), ("/pkg.zip", zip)], 2);
+        let err = download_and_stage(&release_at(&base, "9.9.2"), |_| {}).unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+        assert!(!staging_root().join("9.9.2").exists(), "corrupt download must be deleted");
+    }
+
+    #[test]
+    fn copy_tree_and_app_dir() {
+        let base = std::env::temp_dir().join(format!("pt-updater-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pkg = base.join("extracted").join("Passthrify");
+        std::fs::create_dir_all(pkg.join("sub")).unwrap();
+        std::fs::write(pkg.join("passthrify.exe"), b"new").unwrap();
+        std::fs::write(pkg.join("sub").join("a.txt"), b"x").unwrap();
+        let app = find_app_dir(&base.join("extracted")).unwrap();
+        assert_eq!(app, pkg);
+
+        let install = base.join("install");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("passthrify.exe"), b"old").unwrap();
+        assert_eq!(copy_tree(&app, &install).unwrap(), 2);
+        assert_eq!(std::fs::read(install.join("passthrify.exe")).unwrap(), b"new");
+        assert!(install.join("sub").join("a.txt").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

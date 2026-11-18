@@ -1,5 +1,8 @@
 //! Settings window: sidebar sections + cards, styled after the design board.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use eframe::egui::{self, FontId, Margin, Rect, RichText, Stroke, UiBuilder, Vec2};
 
 use super::app::hotkey_parts;
@@ -8,6 +11,7 @@ use super::theme::{self, icons, Kind};
 use crate::capture::video_mf::VideoMode;
 use crate::color::{ColorInfo, RangePref};
 use crate::config::{Chroma, Codec, Config, PresentMode};
+use crate::updater::{self, UpdateChannel, UpdateState, Updater};
 
 pub enum SettingsOutcome {
     Open,
@@ -23,10 +27,12 @@ pub enum Section {
     Replay,
     Hotkeys,
     Display,
+    Updates,
 }
 
 impl Section {
-    const ALL: [Section; 5] = [Section::Capture, Section::Audio, Section::Replay, Section::Hotkeys, Section::Display];
+    const ALL: [Section; 6] =
+        [Section::Capture, Section::Audio, Section::Replay, Section::Hotkeys, Section::Display, Section::Updates];
     fn label(self) -> &'static str {
         match self {
             Section::Capture => "Capture",
@@ -34,6 +40,7 @@ impl Section {
             Section::Replay => "Replay and recording",
             Section::Hotkeys => "Hotkeys",
             Section::Display => "Display",
+            Section::Updates => "Updates",
         }
     }
 }
@@ -54,6 +61,8 @@ pub struct SettingsUi {
     audio_inputs: Vec<String>,
     audio_outputs: Vec<String>,
     capture: Option<HotkeyField>,
+    /// Why self-update can't install here (dev build, read-only folder), if so.
+    install_blocker: Option<String>,
 }
 
 const W: f32 = 860.0;
@@ -73,6 +82,7 @@ impl SettingsUi {
             audio_inputs,
             audio_outputs,
             capture: None,
+            install_blocker: updater::install_blocker(),
         }
     }
 
@@ -96,6 +106,8 @@ impl SettingsUi {
         actual_chroma: Option<Chroma>,
         color: Option<ColorInfo>,
         hotkey_errors: &[String],
+        updater: &Arc<Updater>,
+        recording: bool,
     ) -> SettingsOutcome {
         self.poll_hotkey_capture(ctx);
         let mut outcome = SettingsOutcome::Open;
@@ -186,6 +198,7 @@ impl SettingsUi {
                             }
                             Section::Hotkeys => self.hotkeys_card(ui, hotkey_errors),
                             Section::Display => self.display_card(ui),
+                            Section::Updates => self.updates_card(ui, updater, recording),
                         }
                     });
                 });
@@ -469,6 +482,166 @@ impl SettingsUi {
         });
     }
 
+    fn updates_card(&mut self, ui: &mut egui::Ui, updater: &Arc<Updater>, recording: bool) {
+        let d = &mut self.draft;
+        let blocker = self.install_blocker.clone();
+        theme::card(ui, "Updates", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Installed version").color(theme::TEXT2));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(updater::current_version().to_string()).font(theme::mono(13.0)).color(theme::TEXT));
+                });
+            });
+            ui.add_space(10.0);
+
+            theme::field_label(ui, "Channel");
+            let repo = updater::repo(d.update_repo.as_deref());
+            if theme::segmented(
+                ui,
+                &mut d.update_channel,
+                &[(UpdateChannel::Stable, "Stable", true), (UpdateChannel::PreRelease, "Pre-release", true)],
+            ) {
+                // Re-check right away so the card reflects the new channel.
+                updater.start_check(repo.clone(), d.update_channel, Duration::ZERO);
+            }
+            let hint = match d.update_channel {
+                UpdateChannel::Stable => "Tested releases only.",
+                UpdateChannel::PreRelease => "Betas and release candidates as well: new features sooner, rougher edges.",
+            };
+            ui.label(RichText::new(hint).size(12.0).color(theme::TEXT3));
+            ui.add_space(8.0);
+            theme::toggle_row(ui, "Check for updates when Passthrify starts", &mut d.check_updates);
+            ui.add_space(12.0);
+
+            // Status + actions.
+            if repo.is_none() {
+                ui.label(
+                    RichText::new("This build has no update source, so it can't check for updates. Official releases include one.")
+                        .color(theme::TEXT2),
+                );
+                ui.label(
+                    RichText::new("To point a self-built copy at a repo, set update_repo = \"owner/name\" in config.toml.")
+                        .size(11.0)
+                        .color(theme::TEXT3),
+                );
+                return;
+            }
+            let state = updater.state();
+            let check_now = |ui: &mut egui::Ui| {
+                if theme::button(ui, Kind::Secondary, None, "Check now", None).clicked() {
+                    updater.start_check(repo.clone(), d.update_channel, Duration::ZERO);
+                }
+            };
+            match &state {
+                UpdateState::Idle => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Not checked yet.").color(theme::TEXT2));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), check_now);
+                    });
+                }
+                UpdateState::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Checking GitHub…").color(theme::TEXT2));
+                    });
+                }
+                UpdateState::UpToDate { checked } => {
+                    ui.horizontal(|ui| {
+                        ui.add(theme::icon_image(icons::CHECK, 16.0, theme::SUCCESS));
+                        ui.label(
+                            RichText::new(format!("You're up to date ({} channel, checked {checked}).", d.update_channel.label()))
+                                .color(theme::TEXT),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), check_now);
+                    });
+                }
+                UpdateState::Error(e) => {
+                    ui.horizontal(|ui| {
+                        ui.add(theme::icon_image(icons::ALERT, 16.0, theme::REC));
+                        ui.add(egui::Label::new(RichText::new(e).color(theme::REC)).wrap());
+                    });
+                    ui.horizontal(|ui| check_now(ui));
+                }
+                UpdateState::Available(rel) | UpdateState::Downloading { release: rel, .. } => {
+                    let downloading = matches!(state, UpdateState::Downloading { .. });
+                    ui.horizontal(|ui| {
+                        ui.add(theme::icon_image(icons::DOWNLOAD, 16.0, theme::SIGNAL));
+                        ui.label(
+                            RichText::new(format!("Passthrify {} is available", rel.tag))
+                                .font(FontId::new(14.0, theme::semibold()))
+                                .color(theme::TEXT),
+                        );
+                        if rel.prerelease {
+                            egui::Frame::new()
+                                .fill(theme::HOVER)
+                                .stroke(Stroke::new(1.0_f32, theme::WARNING))
+                                .corner_radius(4)
+                                .inner_margin(Margin::symmetric(6, 1))
+                                .show(ui, |ui| ui.label(RichText::new("PRE-RELEASE").font(theme::mono(10.0)).color(theme::WARNING)));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let link = ui.add(
+                                egui::Label::new(RichText::new("Release page").font(FontId::new(12.0, theme::medium())).color(theme::SIGNAL))
+                                    .sense(egui::Sense::click()),
+                            );
+                            if link.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(&rel.url));
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(theme::BASE)
+                        .stroke(Stroke::new(1.0_f32, theme::LINE))
+                        .corner_radius(8)
+                        .inner_margin(Margin::same(12))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
+                                release_notes(ui, &rel.notes);
+                            });
+                        });
+                    ui.add_space(8.0);
+                    if let UpdateState::Downloading { progress, .. } = state {
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .text(format!("Downloading {:.0}%", progress * 100.0))
+                                .fill(theme::SIGNAL),
+                        );
+                    } else {
+                        let reason = if recording { Some("Stop the recording first.".to_string()) } else { blocker.clone() };
+                        ui.horizontal(|ui| {
+                            let size_mb = rel.zip_size as f64 / 1_048_576.0;
+                            let install = ui.add_enabled_ui(reason.is_none() && !downloading, |ui| {
+                                theme::button(ui, Kind::Primary, Some(icons::DOWNLOAD), "Install and restart", Some(&format!("{size_mb:.0} MB")))
+                            });
+                            if install.inner.clicked() {
+                                updater.start_install(rel.clone());
+                            }
+                            if let Some(r) = &reason {
+                                ui.label(RichText::new(r).size(12.0).color(theme::TEXT3));
+                            }
+                        });
+                    }
+                }
+                UpdateState::Restarting => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Installing — Passthrify will restart…").color(theme::TEXT2));
+                    });
+                }
+            }
+
+            ui.add_space(10.0);
+            if let Some(r) = &repo {
+                ui.label(
+                    RichText::new(format!("Source: github.com/{r} · downloads are verified with SHA-256"))
+                        .size(11.0)
+                        .color(theme::TEXT3),
+                );
+            }
+        });
+    }
+
     /// While a "Change" is active, the next key combination becomes the hotkey.
     fn poll_hotkey_capture(&mut self, ctx: &egui::Context) {
         let Some(field) = self.capture else { return };
@@ -539,6 +712,32 @@ fn hotkey_string(key: egui::Key, m: egui::Modifiers) -> Option<String> {
     let s = parts.join("+");
     use std::str::FromStr;
     global_hotkey::hotkey::HotKey::from_str(&s).ok().map(|_| s)
+}
+
+/// Minimal Markdown for release notes: headings, bullets, `code`, **bold** markers stripped.
+fn release_notes(ui: &mut egui::Ui, md: &str) {
+    if md.trim().is_empty() {
+        ui.label(RichText::new("No release notes.").color(theme::TEXT3));
+        return;
+    }
+    ui.spacing_mut().item_spacing.y = 3.0;
+    for line in md.lines() {
+        let t = line.trim_end();
+        let clean = |s: &str| s.replace("**", "").replace('`', "");
+        if t.trim().is_empty() {
+            ui.add_space(4.0);
+        } else if let Some(h) = t.trim_start().strip_prefix('#') {
+            let h = h.trim_start_matches('#').trim();
+            ui.label(RichText::new(clean(h)).font(FontId::new(13.0, theme::semibold())).color(theme::TEXT));
+        } else if let Some(b) = t.trim_start().strip_prefix("- ").or_else(|| t.trim_start().strip_prefix("* ")) {
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new("•").color(theme::SIGNAL));
+                ui.add(egui::Label::new(RichText::new(clean(b)).size(12.5).color(theme::TEXT2)).wrap());
+            });
+        } else {
+            ui.add(egui::Label::new(RichText::new(clean(t)).size(12.5).color(theme::TEXT2)).wrap());
+        }
+    }
 }
 
 /// Path text field + "Open" button. Returns true when Open was clicked.

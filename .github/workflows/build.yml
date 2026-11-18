@@ -20,6 +20,9 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Baked into the exe (option_env!) so the in-app updater knows where to look.
+      PASSTHRIFY_REPO: ${{ github.repository }}
     defaults:
       run:
         shell: pwsh

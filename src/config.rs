@@ -141,6 +141,13 @@ pub struct Config {
 
     pub windows_notifications: bool,
     pub present_mode: PresentMode,
+
+    /// Which releases to offer: stable only, or pre-releases too.
+    pub update_channel: crate::updater::UpdateChannel,
+    /// Check GitHub for a newer version at startup.
+    pub check_updates: bool,
+    /// `owner/name` override for the update source (official builds have one built in).
+    pub update_repo: Option<String>,
 }
 
 impl Default for Config {
@@ -177,6 +184,9 @@ impl Default for Config {
             hotkey_screenshot: "Alt+F1".into(),
             windows_notifications: true,
             present_mode: PresentMode::Mailbox,
+            update_channel: crate::updater::UpdateChannel::Stable,
+            check_updates: true,
+            update_repo: None,
         }
     }
 }

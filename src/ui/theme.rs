@@ -180,6 +180,7 @@ pub mod icons {
     icon!(LOCK, r#"<rect x="5.5" y="10.5" width="13" height="9" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>"#);
     icon!(CLOSE, r#"<path d="M7 7l10 10M17 7L7 17"/>"#);
     icon!(DOT, r#"<circle cx="12" cy="12" r="5" fill="white" stroke="none"/>"#);
+    icon!(DOWNLOAD, r#"<path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 19h14"/>"#);
 }
 
 /// The Lens P glyph (keeps its own white + cyan colors).

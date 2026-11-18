@@ -17,6 +17,7 @@ mod screenshot;
 mod svg_raster;
 mod tray;
 mod ui;
+mod updater;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -34,6 +35,8 @@ Passthrify - Elgato capture viewer with instant replay
 USAGE:
   passthrify                    start the app
   passthrify --list-devices     list capture devices, their modes and audio endpoints
+  passthrify --check-update [--repo OWNER/NAME] [--channel stable|prerelease]
+                                check GitHub for a newer release
   passthrify --selftest [SECS] [--out DIR] [--mode WxH@FPS] [--chroma 420|422|444]
              [--codec hevc|h264|av1] [--cycle-modes]
                                 run capture+encode headless for SECS (default 15), then
@@ -52,7 +55,33 @@ fn main() -> Result<()> {
         attach_console();
         return list_devices();
     }
-    init_logging(!args.is_empty());
+    if args.iter().any(|a| a == "--apply-update") {
+        // Installer mode: runs from the staged copy of a new version (see updater.rs).
+        init_logging(false, "update.log");
+        install_panic_hook();
+        return updater::apply_update_main(&args);
+    }
+    if args.iter().any(|a| a == "--check-update") {
+        attach_console();
+        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|j| args.get(j + 1)).cloned();
+        let cfg = Config::load();
+        let channel = match arg("--channel").as_deref() {
+            Some("prerelease") | Some("pre") => updater::UpdateChannel::PreRelease,
+            Some(_) => updater::UpdateChannel::Stable,
+            None => cfg.update_channel,
+        };
+        let repo = updater::repo(arg("--repo").as_deref().or(cfg.update_repo.as_deref()))
+            .ok_or_else(|| anyhow!("no update source: pass --repo owner/name"))?;
+        println!("Passthrify {} checking {repo} ({} channel)", updater::current_version(), channel.label());
+        let releases = updater::fetch_releases(&repo)?;
+        println!("{} release(s) found", releases.len());
+        match updater::pick_release(&releases, channel, &updater::current_version()) {
+            Some(r) => println!("update available: {} ({} bytes) {}", r.tag, r.zip_size, r.url),
+            None => println!("up to date (no newer release with Passthrify-<ver>.zip + .sha256 assets)"),
+        }
+        return Ok(());
+    }
+    init_logging(!args.is_empty(), "passthrify.log");
     install_panic_hook();
     ffmpeg_next::init()?;
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Warning);
@@ -118,7 +147,7 @@ fn run_gui() -> Result<()> {
     .map_err(|e| anyhow!("UI error: {e}"))
 }
 
-fn init_logging(to_stderr: bool) {
+fn init_logging(to_stderr: bool, file_name: &str) {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     use tracing_subscriber::EnvFilter;
 
@@ -126,7 +155,7 @@ fn init_logging(to_stderr: bool) {
         .unwrap_or_else(|_| EnvFilter::new("info,wgpu_core=warn,wgpu_hal=error,naga=warn,eframe=warn,egui_wgpu=warn"));
     let dir = Config::data_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let file = std::fs::File::create(dir.join("passthrify.log")).ok();
+    let file = std::fs::File::create(dir.join(file_name)).ok();
     let builder = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false);
     match (file, to_stderr || cfg!(debug_assertions)) {
         (Some(f), true) => builder.with_writer(std::io::stderr.and(std::sync::Mutex::new(f))).init(),

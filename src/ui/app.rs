@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::hotkeys::Hotkeys;
 use crate::pipeline::{Command, Pipeline, Shared};
 use crate::tray::{self, Tray};
+use crate::updater::{self, UpdateState, Updater};
 
 pub struct App {
     cfg: Config,
@@ -26,6 +27,9 @@ pub struct App {
     fullscreen: bool,
     gpu_ok: bool,
     cycle_modes: bool,
+    updater: Arc<Updater>,
+    /// Version we already announced, so the toast shows once per release.
+    announced_update: Option<semver::Version>,
 }
 
 /// "Alt+F10" -> "Alt F10", "Ctrl+Shift+KeyR" -> "Ctrl Shift R".
@@ -92,6 +96,15 @@ impl App {
             }
         };
 
+        let ctx = cc.egui_ctx.clone();
+        let updater = Updater::new(move || ctx.request_repaint());
+        if let Some((ok, msg)) = updater::take_update_result() {
+            shared.notify(msg, !ok);
+        }
+        if cfg.check_updates {
+            updater.start_check(updater::repo(cfg.update_repo.as_deref()), cfg.update_channel, Duration::from_secs(3));
+        }
+
         let mut app = Self {
             cfg,
             shared,
@@ -103,6 +116,8 @@ impl App {
             fullscreen: false,
             gpu_ok,
             cycle_modes: std::env::var_os("PASSTHRIFY_CYCLE_MODES").is_some(),
+            updater,
+            announced_update: None,
         };
         // PASSTHRIFY_SETTINGS=capture|audio|replay|hotkeys|display opens Settings on launch
         // (handy for docs and screenshots).
@@ -112,6 +127,7 @@ impl App {
                 "replay" => Section::Replay,
                 "hotkeys" => Section::Hotkeys,
                 "display" => Section::Display,
+                "updates" => Section::Updates,
                 _ => Section::Capture,
             };
             app.open_settings(section);
@@ -145,7 +161,8 @@ impl App {
         let recording = recording_since.is_some();
         let capturing = st.capturing.load(Ordering::Relaxed);
         let has_error = st.error.lock().is_some();
-        let compact = ui.available_width() < 1240.0;
+        // Below this the full labels (esp. "Auto (3840x2160)" pickers) collide with the right group.
+        let compact = ui.available_width() < 1400.0;
 
         ui.spacing_mut().interact_size.y = 32.0;
         ui.spacing_mut().combo_height = 400.0;
@@ -249,6 +266,13 @@ impl App {
                         self.settings = None;
                     } else {
                         self.open_settings(Section::Capture);
+                    }
+                }
+                if let UpdateState::Available(rel) = self.updater.state() {
+                    let label = format!("Update {}", rel.tag);
+                    let resp = theme::button_ex(ui, Kind::Secondary, Some(icons::DOWNLOAD), Some(theme::SIGNAL), &label, None);
+                    if resp.on_hover_text("A new version is available — open Settings › Updates").clicked() {
+                        self.open_settings(Section::Updates);
                     }
                 }
                 if theme::icon_button(ui, icons::FULLSCREEN, "Fullscreen (F11 / double-click)", false).clicked() {
@@ -515,6 +539,20 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.fill(theme::VOID))
             .show(ctx, |ui| self.preview(ui));
 
+        // Updates: announce a new release once; close when the installer has taken over.
+        match self.updater.state() {
+            UpdateState::Available(rel) if self.announced_update.as_ref() != Some(&rel.version) => {
+                self.announced_update = Some(rel.version.clone());
+                let kind = if rel.prerelease { "Pre-release" } else { "New version" };
+                self.shared.notify(
+                    format!("Passthrify {} is available: {kind} — open Settings › Updates to install", rel.tag),
+                    false,
+                );
+            }
+            UpdateState::Restarting => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => {}
+        }
+
         self.toasts(ctx);
 
         if let Some(s) = self.settings.as_mut() {
@@ -522,7 +560,8 @@ impl eframe::App for App {
             let current = *self.shared.status.mode.lock();
             let actual_chroma = *self.shared.status.chroma.lock();
             let color = *self.shared.status.color.lock();
-            match s.show(ctx, &modes, current, actual_chroma, color, &self.hotkey_errors) {
+            let recording = self.shared.status.recording_since.lock().is_some();
+            match s.show(ctx, &modes, current, actual_chroma, color, &self.hotkey_errors, &self.updater, recording) {
                 SettingsOutcome::Open => {}
                 SettingsOutcome::Close => self.settings = None,
                 SettingsOutcome::OpenFolder { screenshots: false } => self.pipeline.send(Command::OpenOutputFolder),

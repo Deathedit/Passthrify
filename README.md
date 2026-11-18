@@ -88,6 +88,21 @@ WASAPI capture ─┬─► passthrough ring ─► WASAPI render
   always starts on a keyframe (1 s GOP). Saving a replay just remuxes, with no re-encode.
 - Recordings are fragmented MP4: a crash leaves a playable file.
 
+## Updates
+
+Settings → **Updates** checks GitHub Releases at startup (can be turned off) or on demand.
+- **Stable** offers normal releases only. **Pre-release** also offers betas and release
+  candidates (tags like `v0.2.0-beta.1`).
+- **Install and restart** downloads `Passthrify-<ver>.zip` and verifies it against the release's
+  `.sha256`. It then restarts into the new version, keeping your settings and any other files
+  in the folder.
+- Official builds know their repo from the release workflow (`PASSTHRIFY_REPO`). For a
+  self-built copy, set `update_repo = "owner/name"` in config.toml. To check from the
+  command line: `passthrify --check-update [--repo owner/name] [--channel prerelease]`.
+
+**Cutting a release:** bump `version` in Cargo.toml, commit, then `git tag v0.2.0` and push the
+tag. A version with a suffix (`0.2.0-beta.1`) is published as a pre-release.
+
 ## Design
 
 - **Logo:** "Lens P" in `assets/logo/` (SVG). build.rs renders `passthrify-mark.svg` into the
