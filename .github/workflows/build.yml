@@ -1,5 +1,8 @@
-# Build + test on every push / PR. Pushing a tag like v0.2.0 also publishes a GitHub Release
-# with the packaged zip, its SHA-256 and patch notes generated from the commits since the
+# Build + test on every push / PR.
+# - Push to main: publishes a pre-release dev build (v<next>-dev.<run>) for the Pre-release
+#   update channel, keeping the newest few.
+# - Push a tag like v0.2.0: publishes a release (a pre-release if the version has a suffix).
+# Releases carry the packaged zip, its SHA-256 and patch notes from the commits since the
 # previous tag.
 name: Build
 
@@ -11,11 +14,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # needed to create releases on tag pushes
+  contents: write # needed to create releases
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # How many dev pre-releases to keep (older ones and their tags are deleted).
+  KEEP_DEV_BUILDS: 5
 
 jobs:
   build:
@@ -29,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history + tags for the patch notes
+          fetch-depth: 0 # full history + tags for versions and patch notes
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -42,15 +49,41 @@ jobs:
           path: third_party/ffmpeg
           key: ffmpeg-n8.1-lgpl-shared-${{ hashFiles('build.ps1') }}
 
-      - name: Read version
+      # kind: release (tag push), dev (main) or none (PRs, other branches).
+      - name: Resolve version
         id: version
+        env:
+          IS_MAIN: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
             Select-Object -First 1).Matches[0].Groups[1].Value
-          "version=$ver" >> $env:GITHUB_OUTPUT
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$ver") {
-            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $ver - bump Cargo.toml first."
+          $kind = 'none'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $kind = 'release'
+            if ($env:GITHUB_REF_NAME -ne "v$ver") {
+              throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $ver - bump Cargo.toml first."
+            }
+          } elseif ($env:IS_MAIN -eq 'true') {
+            $kind = 'dev'
+            # A dev build must sort above the last release and below the next one.
+            if ($ver -match '-') {
+              $dev = "$ver.dev.$env:RUN_NUMBER"            # 0.2.0-beta.1 -> 0.2.0-beta.1.dev.N
+            } elseif (git tag -l "v$ver") {
+              $p = $ver.Split('.')                          # 0.1.0 released -> 0.1.1-dev.N
+              $dev = "$($p[0]).$($p[1]).$([int]$p[2] + 1)-dev.$env:RUN_NUMBER"
+            } else {
+              $dev = "$ver-dev.$env:RUN_NUMBER"             # 0.2.0 unreleased -> 0.2.0-dev.N
+            }
+            # Stamp it into Cargo.toml so the exe reports it and build.ps1 names the zip after it.
+            $toml = Get-Content Cargo.toml -Raw
+            $toml = ([regex]'(?m)^version\s*=\s*"[^"]+"').Replace($toml, "version = `"$dev`"", 1)
+            Set-Content Cargo.toml $toml -NoNewline -Encoding utf8NoBOM
+            $ver = $dev
           }
+          Write-Host "Version $ver ($kind)"
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "kind=$kind" >> $env:GITHUB_OUTPUT
 
       # Prerequisite checks, tests, release build, dist\Passthrify + dist\Passthrify-<ver>.zip
       - name: Test, build and package
@@ -72,16 +105,26 @@ jobs:
             dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
           if-no-files-found: error
 
-      # ---- Release (tag pushes only) ------------------------------------------------------
+      # ---- Release (tag pushes and main) --------------------------------------------------
 
       - name: Patch notes
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.version.outputs.kind != 'none'
+        env:
+          KIND: ${{ steps.version.outputs.kind }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
-          $tag = $env:GITHUB_REF_NAME
-          $prev = git describe --tags --abbrev=0 "$tag^" 2>$null
-          if ($LASTEXITCODE -ne 0) { $prev = $null } # first release: no earlier tag
-          $range = if ($prev) { "$prev..$tag" } else { $tag }
+          $tag = "v$env:VERSION"
+          if ($env:KIND -eq 'release') {
+            # Release notes cover everything since the previous real release, not the last dev build.
+            $prev = git describe --tags --abbrev=0 --exclude '*-dev.*' "$tag^" 2>$null
+            $head = $tag
+          } else {
+            $prev = git describe --tags --abbrev=0 --exclude $tag HEAD 2>$null
+            $head = 'HEAD'
+          }
+          if ($LASTEXITCODE -ne 0) { $prev = $null } # no earlier tag
+          $range = if ($prev) { "$prev..$head" } else { $head }
           $since = if ($prev) { "since $prev" } else { "(first release)" }
 
           # One bullet per commit subject; merge commits and release-bump commits are skipped.
@@ -90,10 +133,14 @@ jobs:
             ForEach-Object { "- $_" }
           if (-not $changes) { $changes = @('- Maintenance release.') }
 
-          $zip = "Passthrify-${{ steps.version.outputs.version }}.zip"
-          $notes = @(
-            "## Passthrify $tag"
-            ""
+          $zip = "Passthrify-$env:VERSION.zip"
+          $notes = @("## Passthrify $tag", "")
+          if ($env:KIND -eq 'dev') {
+            $notes += "Automatic pre-release build of ``$($env:GITHUB_SHA.Substring(0, 7))`` on main."
+            $notes += "Less tested than stable releases; offered on the **Pre-release** update channel."
+            $notes += ""
+          }
+          $notes += @(
             "### Changes $since"
             $changes
             ""
@@ -112,13 +159,31 @@ jobs:
           $global:LASTEXITCODE = 0 # don't let the expected `git describe` miss fail the step
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.version.outputs.kind != 'none'
         uses: softprops/action-gh-release@v2
         with:
-          name: Passthrify ${{ github.ref_name }}
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Passthrify v${{ steps.version.outputs.version }}
           body_path: release-notes.md
-          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          prerelease: ${{ steps.version.outputs.kind == 'dev' || contains(steps.version.outputs.version, '-') }}
+          make_latest: ${{ steps.version.outputs.kind == 'release' && !contains(steps.version.outputs.version, '-') }}
           files: |
             dist/Passthrify-${{ steps.version.outputs.version }}.zip
             dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
           fail_on_unmatched_files: true
+
+      - name: Prune old dev builds
+        if: steps.version.outputs.kind == 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $old = gh release list --repo $env:GITHUB_REPOSITORY --limit 200 --json tagName,createdAt |
+            ConvertFrom-Json |
+            Where-Object { $_.tagName -match '-dev\.\d+$' } |
+            Sort-Object { [datetime]$_.createdAt } -Descending |
+            Select-Object -Skip ([int]$env:KEEP_DEV_BUILDS)
+          foreach ($r in $old) {
+            Write-Host "Deleting $($r.tagName)"
+            gh release delete $r.tagName --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes
+          }

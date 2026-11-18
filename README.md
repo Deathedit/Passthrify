@@ -91,17 +91,23 @@ WASAPI capture ─┬─► passthrough ring ─► WASAPI render
 ## Updates
 
 Settings → **Updates** checks GitHub Releases at startup (can be turned off) or on demand.
-- **Stable** offers normal releases only. **Pre-release** also offers betas and release
-  candidates (tags like `v0.2.0-beta.1`).
+- **Stable** offers normal releases only. **Pre-release** also offers betas, release
+  candidates (tags like `v0.2.0-beta.1`) and the automatic dev builds of every push to `main`
+  (`v0.1.1-dev.42`).
 - **Install and restart** downloads `Passthrify-<ver>.zip` and verifies it against the release's
   `.sha256`. It then restarts into the new version, keeping your settings and any other files
   in the folder.
-- Official builds know their repo from the release workflow (`PASSTHRIFY_REPO`). For a
-  self-built copy, set `update_repo = "owner/name"` in config.toml. To check from the
+- Builds check `Deathedit/Passthrify` (`PASSTHRIFY_REPO` in `.cargo/config.toml`; the workflow
+  sets it from the repo it runs in, so a fork points at itself). To use another repo, set
+  `update_repo = "owner/name"` in the app's config.toml. To check from the
   command line: `passthrify --check-update [--repo owner/name] [--channel prerelease]`.
 
 **Cutting a release:** bump `version` in Cargo.toml, commit, then `git tag v0.2.0` and push the
 tag. A version with a suffix (`0.2.0-beta.1`) is published as a pre-release.
+
+**Dev builds:** every push to `main` publishes a pre-release `v<next>-dev.<run>`, where `<next>`
+is the Cargo.toml version, or its next patch if that version is already tagged. Only the
+newest 5 dev builds are kept.
 
 ## Design
 

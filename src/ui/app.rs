@@ -30,6 +30,41 @@ pub struct App {
     updater: Arc<Updater>,
     /// Version we already announced, so the toast shows once per release.
     announced_update: Option<semver::Version>,
+    toolbar_fit: ToolbarFit,
+}
+
+/// Toolbar densities: 0 = full labels and hotkey hints, 1 = no hints and icon-only
+/// Screenshot / Open folder, 2 = icon-only actions and a shorter volume slider, 3 = no
+/// capture pickers, 4 = no device chip either.
+const TOOLBAR_LEVELS: usize = 5;
+/// Minimum space between the left (pickers + actions) and right (volume, settings) groups.
+const TOOLBAR_GAP: f32 = 12.0;
+
+/// Measured toolbar group widths per density, so we pick the roomiest one that fits.
+/// 0.0 means "not measured yet" and is tried optimistically.
+#[derive(Default)]
+struct ToolbarFit {
+    left: [f32; TOOLBAR_LEVELS],
+    right: [f32; TOOLBAR_LEVELS],
+}
+
+impl ToolbarFit {
+    fn pick(&self, width: f32) -> usize {
+        (0..TOOLBAR_LEVELS)
+            .find(|&l| self.left[l] + self.right[l] + TOOLBAR_GAP <= width)
+            .unwrap_or(TOOLBAR_LEVELS - 1)
+    }
+
+    /// Records what `level` actually measured. If its contents changed size (a new picker
+    /// label, the Update button appearing), the other levels' numbers are stale: forget them.
+    fn record(&mut self, level: usize, left: f32, right: f32) {
+        let changed = |old: f32, new: f32| old > 0.0 && (old - new).abs() > 0.5;
+        if changed(self.left[level], left) || changed(self.right[level], right) {
+            *self = Self::default();
+        }
+        self.left[level] = left;
+        self.right[level] = right;
+    }
 }
 
 /// "Alt+F10" -> "Alt F10", "Ctrl+Shift+KeyR" -> "Ctrl Shift R".
@@ -118,6 +153,7 @@ impl App {
             cycle_modes: std::env::var_os("PASSTHRIFY_CYCLE_MODES").is_some(),
             updater,
             announced_update: None,
+            toolbar_fit: ToolbarFit::default(),
         };
         // PASSTHRIFY_SETTINGS=capture|audio|replay|hotkeys|display opens Settings on launch
         // (handy for docs and screenshots).
@@ -151,7 +187,40 @@ impl App {
         }
     }
 
+    /// Lays out the toolbar as two groups that never overlap: the right group is drawn first,
+    /// the left group gets what is left, and both get more compact until they fit.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        use egui::{Align, Layout, Rect, UiBuilder};
+
+        ui.spacing_mut().interact_size.y = 32.0;
+        ui.spacing_mut().combo_height = 400.0;
+        let row = Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 32.0));
+        let level = self.toolbar_fit.pick(row.width());
+
+        let mut right = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
+        self.toolbar_right(&mut right, level);
+        let right_w = right.min_rect().width();
+
+        let mut left_rect = row;
+        left_rect.max.x = (row.max.x - right_w - TOOLBAR_GAP).max(row.min.x);
+        let mut left = ui.new_child(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)));
+        // Last resort when even the most compact level doesn't fit: cut off rather than overlap.
+        let mut clip = ui.clip_rect();
+        clip.max.x = clip.max.x.min(left_rect.max.x);
+        left.set_clip_rect(clip);
+        self.toolbar_left(&mut left, level);
+        let left_w = left.min_rect().width();
+
+        self.toolbar_fit.record(level, left_w, right_w);
+        if left_w + right_w + TOOLBAR_GAP > row.width() && level + 1 < TOOLBAR_LEVELS {
+            // Redo this frame at a denser level instead of showing the overlap.
+            ui.ctx().request_discard("toolbar overflow");
+        }
+        ui.advance_cursor_after_rect(row);
+    }
+
+    /// Device chip, capture pickers and the recording actions.
+    fn toolbar_left(&mut self, ui: &mut egui::Ui, level: usize) {
         let shared = self.shared.clone();
         let st = &shared.status;
         let device = st.device.lock().clone();
@@ -161,13 +230,8 @@ impl App {
         let recording = recording_since.is_some();
         let capturing = st.capturing.load(Ordering::Relaxed);
         let has_error = st.error.lock().is_some();
-        // Below this the full labels (esp. "Auto (3840x2160)" pickers) collide with the right group.
-        let compact = ui.available_width() < 1400.0;
-
-        ui.spacing_mut().interact_size.y = 32.0;
-        ui.spacing_mut().combo_height = 400.0;
-        ui.horizontal(|ui| {
-            // Device chip: status dot + name; opens Settings > Capture.
+        // Device chip: status dot + name; opens Settings > Capture. Dropped last when narrow.
+        if level < 4 {
             let status = if capturing {
                 theme::SUCCESS
             } else if has_error {
@@ -189,8 +253,11 @@ impl App {
             if chip.inner.on_hover_text(tip).clicked() {
                 self.open_settings(Section::Capture);
             }
+        }
 
-            // Chroma -> resolution -> frame rate -> codec. Applied immediately.
+        // Chroma -> resolution -> frame rate -> codec. Applied immediately. When narrow these
+        // give way to the actions (they are also in Settings > Capture).
+        if level < 3 {
             let mut pref = self.cfg.video_mode;
             let mut codec = self.cfg.codec;
             let mut chroma = self.cfg.chroma;
@@ -220,88 +287,95 @@ impl App {
                     s.sync_capture(&self.cfg);
                 }
             }
+            ui.add_space(if level >= 2 { 4.0 } else { 8.0 });
+        }
 
-            ui.add_space(8.0);
+        // Actions.
+        let save_hint = pretty_hotkey(&self.cfg.hotkey_save_replay);
+        let save = theme::button(
+            ui,
+            Kind::Primary,
+            Some(icons::REPLAY),
+            if level >= 2 { "" } else { "Save replay" },
+            (level == 0 && !save_hint.is_empty()).then_some(save_hint.as_str()),
+        );
+        let mut save_tip = format!("Save replay: the last {} s", self.cfg.replay_seconds);
+        if !save_hint.is_empty() {
+            save_tip += &format!(" ({save_hint})");
+        }
+        if save.on_hover_text(save_tip).clicked() {
+            self.pipeline.send(Command::SaveReplay);
+        }
 
-            // Actions.
-            let save_hint = pretty_hotkey(&self.cfg.hotkey_save_replay);
-            let save = theme::button(
-                ui,
-                Kind::Primary,
-                Some(icons::REPLAY),
-                "Save replay",
-                (!compact && !save_hint.is_empty()).then_some(save_hint.as_str()),
-            );
-            if save.on_hover_text(format!("Save the last {} s", self.cfg.replay_seconds)).clicked() {
-                self.pipeline.send(Command::SaveReplay);
+        let rec_tip = format!("Start / stop recording ({})", pretty_hotkey(&self.cfg.hotkey_toggle_record));
+        let rec = match recording_since {
+            Some(since) => {
+                let clock = theme::fmt_clock(since.elapsed().as_secs());
+                theme::button(ui, Kind::Danger, Some(icons::STOP), if level >= 2 { "" } else { "Stop" }, Some(&clock))
             }
-
-            let rec_tip = format!("Start / stop recording ({})", pretty_hotkey(&self.cfg.hotkey_toggle_record));
-            let rec = match recording_since {
-                Some(since) => {
-                    let clock = theme::fmt_clock(since.elapsed().as_secs());
-                    theme::button(ui, Kind::Danger, Some(icons::STOP), "Stop", Some(&clock))
-                }
-                None => theme::button_ex(ui, Kind::Secondary, Some(icons::RECORD), Some(theme::REC), "Record", None),
-            };
-            if rec.on_hover_text(rec_tip).clicked() {
-                self.pipeline.send(Command::ToggleRecord);
+            None => {
+                let label = if level >= 2 { "" } else { "Record" };
+                theme::button_ex(ui, Kind::Secondary, Some(icons::RECORD), Some(theme::REC), label, None)
             }
+        };
+        if rec.on_hover_text(rec_tip).clicked() {
+            self.pipeline.send(Command::ToggleRecord);
+        }
 
-            let shot_tip = format!("Screenshot ({})", pretty_hotkey(&self.cfg.hotkey_screenshot));
-            let shot = theme::button(ui, Kind::Secondary, Some(icons::CAMERA), if compact { "" } else { "Screenshot" }, None);
-            if shot.on_hover_text(shot_tip).clicked() {
-                self.pipeline.send(Command::Screenshot);
-            }
-            let folder = theme::button(ui, Kind::Ghost, Some(icons::FOLDER), if compact { "" } else { "Open folder" }, None);
-            if folder.on_hover_text(self.cfg.output_dir.display().to_string()).clicked() {
-                self.pipeline.send(Command::OpenOutputFolder);
-            }
+        let shot_tip = format!("Screenshot ({})", pretty_hotkey(&self.cfg.hotkey_screenshot));
+        let shot = theme::button(ui, Kind::Secondary, Some(icons::CAMERA), if level >= 1 { "" } else { "Screenshot" }, None);
+        if shot.on_hover_text(shot_tip).clicked() {
+            self.pipeline.send(Command::Screenshot);
+        }
+        let folder = theme::button(ui, Kind::Ghost, Some(icons::FOLDER), if level >= 1 { "" } else { "Open folder" }, None);
+        if folder.on_hover_text(self.cfg.output_dir.display().to_string()).clicked() {
+            self.pipeline.send(Command::OpenOutputFolder);
+        }
+    }
 
-            // Right side: settings, fullscreen, volume, mute.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if theme::icon_button(ui, icons::SETTINGS, "Settings", self.settings.is_some()).clicked() {
-                    if self.settings.is_some() {
-                        self.settings = None;
-                    } else {
-                        self.open_settings(Section::Capture);
-                    }
-                }
-                if let UpdateState::Available(rel) = self.updater.state() {
-                    let label = format!("Update {}", rel.tag);
-                    let resp = theme::button_ex(ui, Kind::Secondary, Some(icons::DOWNLOAD), Some(theme::SIGNAL), &label, None);
-                    if resp.on_hover_text("A new version is available — open Settings › Updates").clicked() {
-                        self.open_settings(Section::Updates);
-                    }
-                }
-                if theme::icon_button(ui, icons::FULLSCREEN, "Fullscreen (F11 / double-click)", false).clicked() {
-                    let on = !self.fullscreen;
-                    self.set_fullscreen(ui.ctx(), on);
-                }
-                ui.add_space(4.0);
-                // Compact slider: knob size follows interact height, so shrink it here.
-                let resp = ui
-                    .scope(|ui| {
-                        ui.spacing_mut().slider_width = 96.0;
-                        ui.spacing_mut().interact_size.y = 16.0;
-                        ui.add(egui::Slider::new(&mut self.cfg.volume, 0.0..=2.0).show_value(false))
-                    })
-                    .inner
-                    .on_hover_text(format!("Passthrough volume {:.0}%", self.cfg.volume * 100.0));
-                if resp.changed() {
-                    self.shared.ring.set_volume(self.cfg.volume);
-                }
-                let muted = self.cfg.muted || self.cfg.volume == 0.0;
-                let icon = if muted { icons::MUTED } else { icons::SPEAKER };
-                if theme::icon_button(ui, icon, if self.cfg.muted { "Unmute passthrough" } else { "Mute passthrough" }, false)
-                    .clicked()
-                {
-                    self.cfg.muted = !self.cfg.muted;
-                    self.shared.ring.set_muted(self.cfg.muted);
-                }
-            });
-        });
+    /// Right side, laid out right-to-left: settings, update, fullscreen, volume, mute.
+    fn toolbar_right(&mut self, ui: &mut egui::Ui, level: usize) {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if theme::icon_button(ui, icons::SETTINGS, "Settings", self.settings.is_some()).clicked() {
+            if self.settings.is_some() {
+                self.settings = None;
+            } else {
+                self.open_settings(Section::Capture);
+            }
+        }
+        if let UpdateState::Available(rel) = self.updater.state() {
+            let label = if level >= 2 { String::new() } else { format!("Update {}", rel.tag) };
+            let resp = theme::button_ex(ui, Kind::Secondary, Some(icons::DOWNLOAD), Some(theme::SIGNAL), &label, None);
+            let tip = format!("{} is available — open Settings › Updates", rel.tag);
+            if resp.on_hover_text(tip).clicked() {
+                self.open_settings(Section::Updates);
+            }
+        }
+        if theme::icon_button(ui, icons::FULLSCREEN, "Fullscreen (F11 / double-click)", false).clicked() {
+            let on = !self.fullscreen;
+            self.set_fullscreen(ui.ctx(), on);
+        }
+        ui.add_space(4.0);
+        // Compact slider: knob size follows interact height, so shrink it here.
+        let resp = ui
+            .scope(|ui| {
+                ui.spacing_mut().slider_width = if level >= 2 { 64.0 } else { 96.0 };
+                ui.spacing_mut().interact_size.y = 16.0;
+                ui.add(egui::Slider::new(&mut self.cfg.volume, 0.0..=2.0).show_value(false))
+            })
+            .inner
+            .on_hover_text(format!("Passthrough volume {:.0}%", self.cfg.volume * 100.0));
+        if resp.changed() {
+            self.shared.ring.set_volume(self.cfg.volume);
+        }
+        let muted = self.cfg.muted || self.cfg.volume == 0.0;
+        let icon = if muted { icons::MUTED } else { icons::SPEAKER };
+        if theme::icon_button(ui, icon, if self.cfg.muted { "Unmute passthrough" } else { "Mute passthrough" }, false)
+            .clicked()
+        {
+            self.cfg.muted = !self.cfg.muted;
+            self.shared.ring.set_muted(self.cfg.muted);
+        }
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {

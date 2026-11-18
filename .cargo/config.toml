@@ -4,3 +4,6 @@
 FFMPEG_DIR = { value = "third_party/ffmpeg", relative = true }
 # libclang for ffmpeg-sys-next's bindgen step.
 LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+# Update source baked into the exe (updater.rs). CI sets the same from github.repository;
+# existing environment values win, so a fork's workflow points at the fork.
+PASSTHRIFY_REPO = "Deathedit/Passthrify"
