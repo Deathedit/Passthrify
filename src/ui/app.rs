@@ -872,7 +872,7 @@ impl App {
         match generated.or_else(|| self.shared.latest_frame.load_full()) {
             Some(frame) if self.gpu_ok => {
                 let r = letterbox(rect, frame.width, frame.height);
-                ui.painter().add(egui_wgpu::Callback::new_paint_callback(r, PreviewCallback { frame }));
+                ui.painter().add(egui_wgpu::Callback::new_paint_callback(r, PreviewCallback { frame, target: self.shared.preview_target.clone() }));
                 if let Some(since) = *self.shared.status.recording_since.lock() {
                     self.rec_pill(ui, r.min + egui::vec2(16.0, 16.0), since.elapsed().as_secs());
                 }

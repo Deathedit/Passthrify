@@ -138,6 +138,10 @@ WASAPI capture ─┬─► passthrough ring ─► WASAPI render
   0.5 ms at 4K). NVENC and frame generation both read that copy, so the encoder does no CPU copy
   of its own: about 0.2 ms of CPU per 4K frame instead of 1.4 ms. The log shows per-frame timings
   every 10 s. `gpu_frames = false` in config.toml goes back to system-memory encoding.
+- The preview reads that copy too: its frame buffer is Vulkan memory shared with CUDA, the
+  capture thread copies each frame into it on the GPU, and the preview copies it into its
+  textures there (0.04 ms on the UI thread instead of a 0.5 ms upload). Frame generation's
+  generated frames and 4:4:4 still upload from the CPU.
 
 ## Updates
 
@@ -183,5 +187,4 @@ dev builds are kept.
 
 - HDR (P010) capture/encode. Use SDR output, or let the card tone-map.
 - AMD/Intel encoders and older DirectShow-only Elgato cards (HD60 S, HD60 Pro).
-- Full zero-copy: Elgato's driver delivers frames in system memory, so one upload is the minimum,
-  and the preview still uploads its own copy.
+- Full zero-copy: Elgato's driver delivers frames in system memory, so one upload is the minimum.

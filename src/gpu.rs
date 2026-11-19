@@ -46,6 +46,10 @@ struct Driver {
     event_sync: unsafe extern "system" fn(CuEvent) -> CuResult,
     host_alloc: unsafe extern "system" fn(*mut *mut c_void, usize, u32) -> CuResult,
     host_free: unsafe extern "system" fn(*mut c_void) -> CuResult,
+    import_ext_mem: unsafe extern "system" fn(*mut CuExtMem, *const ExtMemHandleDesc) -> CuResult,
+    ext_mem_buffer: unsafe extern "system" fn(*mut u64, CuExtMem, *const ExtMemBufferDesc) -> CuResult,
+    destroy_ext_mem: unsafe extern "system" fn(CuExtMem) -> CuResult,
+    mem_free: unsafe extern "system" fn(u64) -> CuResult,
 }
 
 fn driver() -> Result<&'static Driver> {
@@ -75,6 +79,10 @@ impl Driver {
         let host_alloc = sym(lib, s!("cuMemHostAlloc"))?;
         let host_free = sym(lib, s!("cuMemFreeHost"))?;
         let memcpy2d_async = sym(lib, s!("cuMemcpy2DAsync_v2"))?;
+        let import_ext_mem = sym(lib, s!("cuImportExternalMemory"))?;
+        let ext_mem_buffer = sym(lib, s!("cuExternalMemoryGetMappedBuffer"))?;
+        let destroy_ext_mem = sym(lib, s!("cuDestroyExternalMemory"))?;
+        let mem_free = sym(lib, s!("cuMemFree_v2"))?;
 
         let check = |r: CuResult, what: &str| if r == 0 { Ok(()) } else { Err(anyhow!("{what} failed (CUDA error {r})")) };
         check(init(0), "cuInit")?;
@@ -107,6 +115,10 @@ impl Driver {
             event_sync,
             host_alloc,
             host_free,
+            import_ext_mem,
+            ext_mem_buffer,
+            destroy_ext_mem,
+            mem_free,
         })
     }
 
@@ -130,12 +142,18 @@ impl Driver {
     /// Copies planes (host pointer, host pitch, device pointer, device pitch, row bytes, rows)
     /// to the GPU on the upload stream and waits for them. Pinned sources go by DMA.
     fn upload_planes(&self, planes: &[(*const u8, usize, *mut u8, usize, usize, usize)]) -> Result<()> {
+        self.copy_planes(planes, false)
+    }
+
+    /// Like `upload_planes`, with `src_device`: the sources are device pointers too.
+    fn copy_planes(&self, planes: &[(*const u8, usize, *mut u8, usize, usize, usize)], src_device: bool) -> Result<()> {
         let stream = self.upload_stream as CuStream;
         self.with_ctx("cuMemcpy2DAsync", || unsafe {
             for &(src, src_pitch, dst, dst_pitch, width, rows) in planes {
                 let c = CudaMemcpy2d {
-                    src_memory_type: CU_MEMORYTYPE_HOST,
-                    src_host: src.cast(),
+                    src_memory_type: if src_device { CU_MEMORYTYPE_DEVICE } else { CU_MEMORYTYPE_HOST },
+                    src_host: if src_device { std::ptr::null() } else { src.cast() },
+                    src_device: if src_device { src as u64 } else { 0 },
                     src_pitch,
                     dst_memory_type: CU_MEMORYTYPE_DEVICE,
                     dst_device: dst as u64,
@@ -226,6 +244,202 @@ struct CudaMemcpy2d {
 impl Default for CudaMemcpy2d {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
+    }
+}
+
+type CuExtMem = *mut c_void;
+const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32: u32 = 2;
+const CUDA_EXTERNAL_MEMORY_DEDICATED: u32 = 1;
+
+/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` from cuda.h (the handle union is 16 bytes).
+#[repr(C)]
+struct ExtMemHandleDesc {
+    handle_type: u32,
+    win32_handle: *mut c_void,
+    win32_name: *const c_void,
+    size: u64,
+    flags: u32,
+    reserved: [u32; 16],
+}
+
+/// `CUDA_EXTERNAL_MEMORY_BUFFER_DESC` from cuda.h.
+#[repr(C)]
+struct ExtMemBufferDesc {
+    offset: u64,
+    size: u64,
+    flags: u32,
+    reserved: [u32; 16],
+}
+
+const SLOT_FREE: u8 = 0;
+const SLOT_WRITING: u8 = 1;
+const SLOT_READY: u8 = 2;
+const SLOT_READING: u8 = 3;
+
+struct Slot {
+    state: std::sync::atomic::AtomicU8,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+/// Number of frame slots in the preview buffer: one being written, one being read by the
+/// GPU, one ready.
+pub const PREVIEW_SLOTS: usize = 3;
+
+/// The preview's frame buffer in GPU memory, allocated by the UI's graphics API (Vulkan) and
+/// imported into CUDA. The capture thread copies each CUDA frame into a free slot on the GPU;
+/// the preview copies a ready slot into its textures, so the frame never goes back through
+/// the CPU. Each slot holds the Y plane, then the interleaved UV plane, with 256-byte pitches.
+pub struct PreviewTarget {
+    pub width: u32,
+    pub height: u32,
+    pub chroma: Chroma,
+    pub y_pitch: usize,
+    pub uv_pitch: usize,
+    pub slot_size: usize,
+    dev_ptr: u64,
+    ext_mem: usize,
+    slots: [Slot; PREVIEW_SLOTS],
+}
+
+unsafe impl Send for PreviewTarget {}
+unsafe impl Sync for PreviewTarget {}
+
+impl PreviewTarget {
+    /// Row pitches and slot size for a frame shape (pitches 256-byte aligned for wgpu copies).
+    pub fn layout(width: u32, height: u32, chroma: Chroma) -> (usize, usize, usize) {
+        let align = |n: usize| n.div_ceil(256) * 256;
+        let (cw, ch) = crate::capture::chroma_size(width, height, chroma);
+        let (y_pitch, uv_pitch) = (align(width as usize), align(cw as usize * 2));
+        (y_pitch, uv_pitch, align(y_pitch * height as usize + uv_pitch * ch as usize))
+    }
+
+    /// Only interleaved-UV frames (NV12, NV16); 4:4:4 CUDA frames are planar.
+    pub fn supports(chroma: Chroma) -> bool {
+        chroma != Chroma::S444
+    }
+
+    /// Imports `memory_size` bytes of exported Vulkan memory (an opaque Win32 handle; the
+    /// caller still owns and closes it) for `PREVIEW_SLOTS` slots of this frame shape.
+    pub fn import(handle: *mut c_void, memory_size: u64, width: u32, height: u32, chroma: Chroma) -> Result<Self> {
+        let d = driver()?;
+        let (y_pitch, uv_pitch, slot_size) = Self::layout(width, height, chroma);
+        let size = (slot_size * PREVIEW_SLOTS) as u64;
+        if size > memory_size {
+            bail!("preview memory too small ({memory_size} < {size})");
+        }
+        let desc = ExtMemHandleDesc {
+            handle_type: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32,
+            win32_handle: handle,
+            win32_name: std::ptr::null(),
+            size: memory_size,
+            flags: CUDA_EXTERNAL_MEMORY_DEDICATED,
+            reserved: [0; 16],
+        };
+        let mut ext_mem = std::ptr::null_mut();
+        d.with_ctx("cuImportExternalMemory", || unsafe { (d.import_ext_mem)(&mut ext_mem, &desc) })?;
+        let buf = ExtMemBufferDesc { offset: 0, size, flags: 0, reserved: [0; 16] };
+        let mut dev_ptr = 0u64;
+        if let Err(e) = d.with_ctx("cuExternalMemoryGetMappedBuffer", || unsafe { (d.ext_mem_buffer)(&mut dev_ptr, ext_mem, &buf) }) {
+            let _ = d.with_ctx("cuDestroyExternalMemory", || unsafe { (d.destroy_ext_mem)(ext_mem) });
+            return Err(e);
+        }
+        let slot = || Slot { state: SLOT_FREE.into(), seq: 0.into() };
+        Ok(Self {
+            width,
+            height,
+            chroma,
+            y_pitch,
+            uv_pitch,
+            slot_size,
+            dev_ptr,
+            ext_mem: ext_mem as usize,
+            slots: [slot(), slot(), slot()],
+        })
+    }
+
+    pub fn matches(&self, f: &VideoFrame) -> bool {
+        f.width == self.width && f.height == self.height && f.chroma == self.chroma
+    }
+
+    /// Byte offsets of slot `i`'s Y and UV planes in the buffer.
+    pub fn plane_offsets(&self, i: usize) -> (u64, u64) {
+        let y = (i * self.slot_size) as u64;
+        (y, y + (self.y_pitch * self.height as usize) as u64)
+    }
+
+    /// Capture thread: copies `g` (a CUDA frame of this shape) into a free slot on the GPU and
+    /// marks it ready as frame `seq`. False when no slot is free (the preview then uploads that
+    /// frame from the CPU) or the copy failed.
+    pub fn write(&self, g: &GpuFrame, seq: u64) -> bool {
+        use std::sync::atomic::Ordering::*;
+        // A free slot, else the oldest ready one (never one the preview is reading).
+        let pick = (0..PREVIEW_SLOTS)
+            .filter(|&i| self.slots[i].state.load(Acquire) == SLOT_FREE)
+            .chain(
+                (0..PREVIEW_SLOTS)
+                    .filter(|&i| self.slots[i].state.load(Acquire) == SLOT_READY)
+                    .min_by_key(|&i| self.slots[i].seq.load(Acquire)),
+            )
+            .find(|&i| {
+                let s = &self.slots[i].state;
+                s.compare_exchange(SLOT_FREE, SLOT_WRITING, AcqRel, Acquire).is_ok()
+                    || s.compare_exchange(SLOT_READY, SLOT_WRITING, AcqRel, Acquire).is_ok()
+            });
+        let Some(i) = pick else { return false };
+        let p = g.planes();
+        let (yo, uvo) = self.plane_offsets(i);
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = crate::capture::chroma_size(self.width, self.height, self.chroma);
+        let base = self.dev_ptr as usize;
+        let ok = driver()
+            .and_then(|d| {
+                d.copy_planes(
+                    &[
+                        (p.y, p.y_pitch as usize, (base + yo as usize) as *mut u8, self.y_pitch, w, h),
+                        (p.u, p.uv_pitch as usize, (base + uvo as usize) as *mut u8, self.uv_pitch, cw as usize * 2, ch as usize),
+                    ],
+                    true,
+                )
+            })
+            .is_ok();
+        let slot = &self.slots[i];
+        if ok {
+            slot.seq.store(seq, Release);
+            slot.state.store(SLOT_READY, Release);
+        } else {
+            slot.state.store(SLOT_FREE, Release);
+        }
+        ok
+    }
+
+    /// Preview: claims the ready slot holding frame `seq` for reading.
+    pub fn take(&self, seq: u64) -> Option<usize> {
+        use std::sync::atomic::Ordering::*;
+        (0..PREVIEW_SLOTS).find(|&i| {
+            let s = &self.slots[i];
+            s.state.load(Acquire) == SLOT_READY
+                && s.seq.load(Acquire) == seq
+                && s.state.compare_exchange(SLOT_READY, SLOT_READING, AcqRel, Acquire).is_ok()
+                // Rewritten between the checks: give it back.
+                && (s.seq.load(Acquire) == seq || {
+                    s.state.store(SLOT_READY, Release);
+                    false
+                })
+        })
+    }
+
+    /// Preview: the GPU has finished reading slot `i`.
+    pub fn release(&self, i: usize) {
+        self.slots[i].state.store(SLOT_FREE, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for PreviewTarget {
+    fn drop(&mut self) {
+        if let Ok(d) = driver() {
+            let _ = d.with_ctx("cuMemFree", || unsafe { (d.mem_free)(self.dev_ptr) });
+            let _ = d.with_ctx("cuDestroyExternalMemory", || unsafe { (d.destroy_ext_mem)(self.ext_mem as CuExtMem) });
+        }
     }
 }
 

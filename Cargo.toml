@@ -40,6 +40,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 global-hotkey = "0.6"
 tray-icon = "0.19"
 tauri-winrt-notification = "0.7"
+# Raw Vulkan calls for the preview buffer shared with CUDA (same version as wgpu-hal uses).
+ash = { version = "0.38", default-features = false }
 
 [dependencies.windows]
 version = "0.58"

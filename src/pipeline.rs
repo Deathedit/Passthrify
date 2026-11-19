@@ -93,6 +93,9 @@ pub struct Shared {
     pub windows_notifications: AtomicBool,
     /// Preview frame generation (off unless turned on in Settings › Display).
     pub frame_gen: crate::vfg::FrameGen,
+    /// The preview's GPU frame buffer shared with CUDA (set by the UI once it has one for
+    /// the current shape); the capture thread copies each CUDA frame into it.
+    pub preview_target: Arc<ArcSwapOption<crate::gpu::PreviewTarget>>,
     toasts: Mutex<Vec<Toast>>,
     repaint: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
@@ -105,6 +108,7 @@ impl Shared {
             ring: Arc::new(PassRing::new(cfg.volume, cfg.muted)),
             windows_notifications: AtomicBool::new(cfg.windows_notifications),
             frame_gen: crate::vfg::FrameGen::new(cfg),
+            preview_target: Arc::default(),
             toasts: Mutex::new(Vec::new()),
             repaint: OnceLock::new(),
         }
@@ -292,14 +296,23 @@ impl Session {
                             st.fps_x100.store((r.signal * 100.0) as u32, Ordering::Relaxed);
                             st.game_fps_x100.store((r.game * 100.0) as u32, Ordering::Relaxed);
                         }
-                        // The preview first, so it never waits for the upload below.
-                        sh_frame.latest_frame.store(Some(frame.clone()));
-                        sh_frame.request_repaint();
-                        // One upload to CUDA for the encoder and frame generation.
-                        let cuda = gpu_frames.lock().clone();
-                        if let Some(cuda) = cuda.filter(|c| c.matches(&frame)) {
+                        let cuda = gpu_frames.lock().clone().filter(|c| c.matches(&frame));
+                        // With a preview buffer on the GPU, the preview takes the frame from
+                        // there, so it waits for the upload. Otherwise it goes first and
+                        // uploads it itself, without waiting for ours.
+                        let target = sh_frame.preview_target.load_full().filter(|t| t.matches(&frame));
+                        let preview_first = cuda.is_none() || target.is_none();
+                        if preview_first {
+                            sh_frame.latest_frame.store(Some(frame.clone()));
+                            sh_frame.request_repaint();
+                        }
+                        // One upload to CUDA for the encoder, frame generation and the preview.
+                        if let Some(cuda) = cuda {
                             match crate::perf::GPU_UPLOAD.time(|| cuda.upload(&frame, &mut scratch)) {
                                 Ok(g) => {
+                                    if let Some(t) = &target {
+                                        crate::perf::PREVIEW_COPY.time(|| t.write(&g, frame.seq));
+                                    }
                                     let _ = frame.gpu.set(g);
                                     upload_failed = false;
                                 }
@@ -309,6 +322,10 @@ impl Session {
                                 }
                                 Err(_) => {}
                             }
+                        }
+                        if !preview_first {
+                            sh_frame.latest_frame.store(Some(frame.clone()));
+                            sh_frame.request_repaint();
                         }
                         sh_frame.feed_frame_gen(&frame);
                         if let Some(tx) = frame_tx.lock().as_ref() {

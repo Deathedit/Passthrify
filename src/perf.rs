@@ -53,10 +53,15 @@ pub static GPU_UPLOAD: Stat = Stat::new("gpu upload");
 pub static ENCODE_PREP: Stat = Stat::new("encode prep");
 /// avcodec_send_frame + receiving packets (includes NVENC's own upload of system memory frames).
 pub static ENCODE_SEND: Stat = Stat::new("encode send");
-/// Preview texture upload on the UI thread.
+/// CUDA frame -> preview buffer slot, on the GPU (capture thread).
+pub static PREVIEW_COPY: Stat = Stat::new("preview copy");
+/// Preview texture upload from the CPU on the UI thread (frames without a GPU slot).
 pub static PREVIEW_UPLOAD: Stat = Stat::new("preview upload");
+/// Preview buffer slot -> textures, recorded and submitted on the UI thread.
+pub static PREVIEW_GPU: Stat = Stat::new("preview gpu copy");
 
-pub static ALL: [&Stat; 5] = [&CAPTURE_COPY, &GPU_UPLOAD, &ENCODE_PREP, &ENCODE_SEND, &PREVIEW_UPLOAD];
+pub static ALL: [&Stat; 7] =
+    [&CAPTURE_COPY, &GPU_UPLOAD, &PREVIEW_COPY, &ENCODE_PREP, &ENCODE_SEND, &PREVIEW_UPLOAD, &PREVIEW_GPU];
 
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 
