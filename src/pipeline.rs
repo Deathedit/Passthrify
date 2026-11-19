@@ -23,6 +23,7 @@ use crate::capture::{audio_wasapi, AudioChunk, VideoFrame};
 use crate::color::ColorInfo;
 use crate::config::{Chroma, Codec, Config};
 use crate::encode;
+use crate::gpu::CudaFrames;
 use crate::packets::{PacketBus, StreamParams};
 use crate::recorder::Recorder;
 use crate::{mux, notify, screenshot};
@@ -228,6 +229,8 @@ struct Session {
     mode_rx: Receiver<(VideoMode, Chroma, ColorInfo)>,
     frame_tx: Arc<Mutex<Option<Sender<Arc<VideoFrame>>>>>,
     audio_tx: Arc<Mutex<Option<Sender<AudioChunk>>>>,
+    /// CUDA frames for the current mode; the capture thread uploads each frame into one.
+    gpu_frames: Arc<Mutex<Option<Arc<CudaFrames>>>>,
     encoders: Option<Encoders>,
     bus: Arc<PacketBus>,
     params: Arc<StreamParams>,
@@ -243,16 +246,19 @@ impl Session {
         let stop = Arc::new(AtomicBool::new(false));
         let frame_tx: Arc<Mutex<Option<Sender<Arc<VideoFrame>>>>> = Arc::default();
         let audio_tx: Arc<Mutex<Option<Sender<AudioChunk>>>> = Arc::default();
+        let gpu_frames: Arc<Mutex<Option<Arc<CudaFrames>>>> = Arc::default();
         let (mode_tx, mode_rx) = unbounded();
         let mut threads = Vec::new();
 
         // Video capture.
         {
             let (sh_open, sh_frame) = (shared.clone(), shared.clone());
-            let (stop, frame_tx) = (stop.clone(), frame_tx.clone());
+            let (stop, frame_tx, gpu_frames) = (stop.clone(), frame_tx.clone(), gpu_frames.clone());
             let (device, pref, chroma, range) = (cfg.video_device.clone(), cfg.video_mode, cfg.chroma, cfg.color_range);
             threads.push(spawn("video-capture", move || {
                 let mut rates = crate::game_fps::FrameRates::default();
+                let mut scratch = Vec::new();
+                let mut upload_failed = false;
                 video_mf::run_capture(
                     device,
                     pref,
@@ -280,14 +286,31 @@ impl Session {
                         }
                     },
                     move |frame| {
+                        let frame = Arc::new(frame);
                         if let Some(r) = rates.push(&frame) {
                             let st = &sh_frame.status;
                             st.fps_x100.store((r.signal * 100.0) as u32, Ordering::Relaxed);
                             st.game_fps_x100.store((r.game * 100.0) as u32, Ordering::Relaxed);
                         }
+                        // The preview first, so it never waits for the upload below.
                         sh_frame.latest_frame.store(Some(frame.clone()));
-                        sh_frame.feed_frame_gen(&frame);
                         sh_frame.request_repaint();
+                        // One upload to CUDA for the encoder and frame generation.
+                        let cuda = gpu_frames.lock().clone();
+                        if let Some(cuda) = cuda.filter(|c| c.matches(&frame)) {
+                            match crate::perf::GPU_UPLOAD.time(|| cuda.upload(&frame, &mut scratch)) {
+                                Ok(g) => {
+                                    let _ = frame.gpu.set(g);
+                                    upload_failed = false;
+                                }
+                                Err(e) if !upload_failed => {
+                                    upload_failed = true;
+                                    tracing::warn!("CUDA upload failed: {e:#}");
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        sh_frame.feed_frame_gen(&frame);
                         if let Some(tx) = frame_tx.lock().as_ref() {
                             if let Err(TrySendError::Full(_)) = tx.try_send(frame) {
                                 sh_frame.status.dropped_frames.fetch_add(1, Ordering::Relaxed);
@@ -343,6 +366,7 @@ impl Session {
             mode_rx,
             frame_tx,
             audio_tx,
+            gpu_frames,
             encoders: None,
             bus,
             params: Arc::default(),
@@ -373,7 +397,18 @@ impl Session {
             );
         }
         let bitrate = self.cfg.bitrate_bps(mode.width, mode.height, mode.fps(), chroma);
-        let vcfg = encode::video::VideoEncoderConfig { codec, mode, chroma, color, bitrate };
+        let gpu = if self.cfg.gpu_frames {
+            match CudaFrames::new(mode.width, mode.height, chroma) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    tracing::warn!("GPU frame path unavailable, encoding from system memory: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let vcfg = encode::video::VideoEncoderConfig { codec, mode, chroma, color, bitrate, gpu: gpu.clone() };
         *self.shared.status.encoder.lock() =
             format!("{} {} {:.0} Mbps", codec.nvenc_name(), chroma.label(), bitrate as f64 / 1e6);
 
@@ -395,6 +430,7 @@ impl Session {
                 }
             }));
         }
+        *self.gpu_frames.lock() = gpu;
         *self.frame_tx.lock() = Some(ftx);
         *self.audio_tx.lock() = Some(atx);
         self.encoders = Some(Encoders { mode, chroma, color, force_idr, joins });
@@ -402,6 +438,7 @@ impl Session {
 
     fn stop_encoders(&mut self) {
         self.stop_recording();
+        *self.gpu_frames.lock() = None;
         *self.frame_tx.lock() = None;
         *self.audio_tx.lock() = None;
         if let Some(enc) = self.encoders.take() {
@@ -444,6 +481,7 @@ impl Session {
         };
         self.shared.status.replay_ms.store(ms.max(0) as u64, Ordering::Relaxed);
         self.shared.status.replay_bytes.store(bytes as u64, Ordering::Relaxed);
+        crate::perf::report_if_due();
     }
 
     fn output_path(&self, kind: &str, ext: &str) -> PathBuf {

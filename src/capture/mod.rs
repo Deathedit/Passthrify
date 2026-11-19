@@ -22,6 +22,10 @@ pub struct VideoFrame {
     /// Arrival time on the session clock.
     pub pts_us: i64,
     pub seq: u64,
+    /// The same frame in CUDA memory when the GPU frame path is on, shared by NVENC and frame
+    /// generation. The preview and screenshots still use `data`. Set by the capture thread
+    /// right after the frame went to the preview, before it goes to the encoder.
+    pub gpu: std::sync::OnceLock<crate::gpu::GpuFrame>,
 }
 
 /// Chroma plane dimensions for a frame size.
@@ -52,42 +56,78 @@ impl VideoFrame {
 /// Recycles large frame buffers so 4K60 capture doesn't hammer the allocator.
 #[derive(Default)]
 pub struct FramePool {
-    free: Mutex<Vec<Vec<u8>>>,
+    free: Mutex<Vec<Buf>>,
+    /// Allocate page-locked (CUDA pinned) memory, so frames upload to the GPU by DMA.
+    pinned: bool,
 }
 
 const POOL_MAX: usize = 12;
 
-impl FramePool {
-    pub fn get(self: &Arc<Self>, len: usize) -> PooledBuf {
-        let mut buf = self.free.lock().pop().unwrap_or_default();
-        if buf.len() != len {
-            buf.resize(len, 0);
+enum Buf {
+    Heap(Vec<u8>),
+    Pinned(crate::gpu::PinnedBuf),
+}
+
+impl Buf {
+    fn len(&self) -> usize {
+        match self {
+            Buf::Heap(v) => v.len(),
+            Buf::Pinned(p) => p.len(),
         }
-        PooledBuf { buf, pool: self.clone() }
+    }
+}
+
+impl FramePool {
+    /// A pool of pinned buffers (falls back to normal memory without CUDA).
+    pub fn pinned() -> Self {
+        Self { free: Mutex::default(), pinned: true }
+    }
+
+    pub fn get(self: &Arc<Self>, len: usize) -> PooledBuf {
+        let buf = match self.free.lock().pop() {
+            Some(Buf::Heap(mut v)) if !self.pinned || v.len() == len => {
+                v.resize(len, 0);
+                Buf::Heap(v)
+            }
+            Some(b @ Buf::Pinned(_)) if b.len() == len => b,
+            _ => match self.pinned.then(|| crate::gpu::PinnedBuf::new(len)).flatten() {
+                Some(p) => Buf::Pinned(p),
+                None => Buf::Heap(vec![0; len]),
+            },
+        };
+        PooledBuf { buf: Some(buf), pool: self.clone() }
     }
 }
 
 pub struct PooledBuf {
-    buf: Vec<u8>,
+    buf: Option<Buf>,
     pool: Arc<FramePool>,
 }
 
 impl PooledBuf {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buf
+        match self.buf.as_mut() {
+            Some(Buf::Heap(v)) => v,
+            Some(Buf::Pinned(p)) => p.as_mut_slice(),
+            None => &mut [],
+        }
     }
 }
 
 impl Deref for PooledBuf {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.buf
+        match self.buf.as_ref() {
+            Some(Buf::Heap(v)) => v,
+            Some(Buf::Pinned(p)) => p.as_slice(),
+            None => &[],
+        }
     }
 }
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {
-        let buf = std::mem::take(&mut self.buf);
+        let Some(buf) = self.buf.take() else { return };
         let mut free = self.pool.free.lock();
         if free.len() < POOL_MAX {
             free.push(buf);

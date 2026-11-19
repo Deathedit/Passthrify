@@ -179,8 +179,10 @@ impl PreviewRenderer {
                 wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             );
         };
-        write(&t.y, f.y_plane(), w, h, w);
-        write(&t.uv, f.uv_plane(), cw, ch, cw * 2);
+        crate::perf::PREVIEW_UPLOAD.time(|| {
+            write(&t.y, f.y_plane(), w, h, w);
+            write(&t.uv, f.uv_plane(), cw, ch, cw * 2);
+        });
     }
 }
 

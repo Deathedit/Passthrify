@@ -304,6 +304,7 @@ impl VideoDevice {
             let buffer = sample.ConvertToContiguousBuffer()?;
 
             let (w, h) = (mode.width as usize, mode.height as usize);
+            let copy_started = std::time::Instant::now();
             let mut out = pool.get(super::frame_len(mode.width, mode.height, chroma));
 
             // Prefer the 2D interface: it gives the real pitch and the top row even for
@@ -325,6 +326,7 @@ impl VideoDevice {
                 let _ = buffer.Unlock();
                 res?;
             }
+            crate::perf::CAPTURE_COPY.add(copy_started.elapsed());
 
             Ok(Some(VideoFrame {
                 width: mode.width,
@@ -334,6 +336,7 @@ impl VideoDevice {
                 data: out,
                 pts_us,
                 seq,
+                gpu: Default::default(),
             }))
         }
     }
@@ -566,7 +569,7 @@ pub fn run_capture(
     range: RangePref,
     stop: Arc<AtomicBool>,
     mut on_open: impl FnMut(Result<(String, Vec<VideoMode>, VideoMode, Chroma, ColorInfo)>),
-    mut on_frame: impl FnMut(Arc<VideoFrame>),
+    mut on_frame: impl FnMut(VideoFrame),
 ) {
     let _com = match super::ComGuard::new() {
         Ok(g) => g,
@@ -576,7 +579,7 @@ pub fn run_capture(
         Ok(g) => g,
         Err(e) => return on_open(Err(e)),
     };
-    let pool = Arc::new(FramePool::default());
+    let pool = Arc::new(FramePool::pinned());
     let mut seq = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
@@ -604,7 +607,7 @@ pub fn run_capture(
             match dev.read_frame(&pool, seq) {
                 Ok(Some(frame)) => {
                     seq += 1;
-                    on_frame(Arc::new(frame));
+                    on_frame(frame);
                 }
                 Ok(None) => {}
                 Err(e) => {

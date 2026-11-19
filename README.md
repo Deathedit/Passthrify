@@ -80,6 +80,8 @@ keep the real frames.
 ```
 passthrify --list-devices            # capture devices, all native modes, audio endpoints
 passthrify --selftest 30 --out DIR   # headless: capture+encode 30 s, record, save replay + screenshot
+passthrify --gpu-test                # no card needed: encode synthetic frames via system memory and
+                                     # CUDA frames, compare CPU time per frame
 ```
 
 ## Build
@@ -132,6 +134,10 @@ WASAPI capture ─┬─► passthrough ring ─► WASAPI render
 - The replay buffer holds **encoded** packets (4K60 HEVC at 50 Mbps ≈ 375 MB per minute) and
   always starts on a keyframe (1 s GOP). Saving a replay just remuxes, with no re-encode.
 - Recordings are fragmented MP4: a crash leaves a playable file.
+- Each captured frame lands in page-locked memory and is uploaded to the GPU once (CUDA, about
+  0.5 ms at 4K). NVENC and frame generation both read that copy, so the encoder does no CPU copy
+  of its own: about 0.2 ms of CPU per 4K frame instead of 1.4 ms. The log shows per-frame timings
+  every 10 s. `gpu_frames = false` in config.toml goes back to system-memory encoding.
 
 ## Updates
 
@@ -177,4 +183,5 @@ dev builds are kept.
 
 - HDR (P010) capture/encode. Use SDR output, or let the card tone-map.
 - AMD/Intel encoders and older DirectShow-only Elgato cards (HD60 S, HD60 Pro).
-- Zero-copy GPU path (frames go through system memory: ~750 MB/s at 4K60, fine on modern PCs).
+- Full zero-copy: Elgato's driver delivers frames in system memory, so one upload is the minimum,
+  and the preview still uploads its own copy.

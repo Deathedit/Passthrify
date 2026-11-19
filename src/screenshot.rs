@@ -52,6 +52,7 @@ mod tests {
             data: buf,
             pts_us: 0,
             seq: 0,
+            gpu: Default::default(),
         };
         let rgb = nv12_to_rgb(&f);
         assert!(rgb[..6].iter().all(|&c| c >= 254), "{rgb:?}");
@@ -73,6 +74,7 @@ mod tests {
             data: buf,
             pts_us: 0,
             seq: 0,
+            gpu: Default::default(),
         };
         assert_eq!(&nv12_to_rgb(&f)[..3], &[16, 16, 16]);
     }

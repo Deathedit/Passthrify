@@ -319,7 +319,7 @@ pub fn self_test(dir: Option<&std::path::Path>, out: &std::path::Path) -> anyhow
                 chroma[i + 1] = 110;
             }
         }
-        VideoFrame { width: w, height: h, chroma: Chroma::S420, color: Default::default(), data, pts_us: 0, seq }
+        VideoFrame { width: w, height: h, chroma: Chroma::S420, color: Default::default(), data, pts_us: 0, seq, gpu: Default::default() }
     };
     for (w, h) in [(1920, 1080), (3840, 2160)] {
         let shape = sdk::Shape {
@@ -523,6 +523,7 @@ mod tests {
             data: pool.get(6),
             pts_us: 0,
             seq,
+            gpu: Default::default(),
         })
     }
 

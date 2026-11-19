@@ -11,6 +11,7 @@ use crate::capture::video_mf::VideoMode;
 use crate::capture::VideoFrame;
 use crate::color::{ColorInfo, Matrix};
 use crate::config::{Chroma, Codec};
+use crate::gpu::CudaFrames;
 use crate::packets::{EncodedPacket, SendParams, StreamKind, StreamParams};
 
 /// Microsecond time base: packets come out on the session clock directly.
@@ -24,6 +25,9 @@ pub struct VideoEncoderConfig {
     /// it correctly (full-range NV12 tagged as limited looks crushed/dark in strict players).
     pub color: ColorInfo,
     pub bitrate: u64,
+    /// Encode from these CUDA frames (frames arrive uploaded by the capture thread, or are
+    /// uploaded here). None = system-memory frames.
+    pub gpu: Option<Arc<CudaFrames>>,
 }
 
 /// Encoder input format per chroma: NV12 (4:2:0), NV16 (4:2:2), planar YUV444 (4:4:4).
@@ -49,7 +53,7 @@ pub fn preset_for(m: &VideoMode) -> &'static str {
     }
 }
 
-pub fn open(cfg: &VideoEncoderConfig) -> Result<ff::encoder::Video> {
+pub fn open(cfg: &VideoEncoderConfig, gpu: Option<&CudaFrames>) -> Result<ff::encoder::Video> {
     if !cfg.codec.supports(cfg.chroma) {
         anyhow::bail!("{} can't encode {} on NVENC; pick HEVC or H.264", cfg.codec.short_label(), cfg.chroma.label());
     }
@@ -59,7 +63,14 @@ pub fn open(cfg: &VideoEncoderConfig) -> Result<ff::encoder::Video> {
     let m = &cfg.mode;
     enc.set_width(m.width);
     enc.set_height(m.height);
-    enc.set_format(pixel_format(cfg.chroma));
+    match gpu {
+        // CUDA frames: NVENC reads them in place (registered device memory), no upload.
+        Some(g) => unsafe {
+            enc.set_format(ff::format::Pixel::CUDA);
+            (*enc.as_mut_ptr()).hw_frames_ctx = ff::ffi::av_buffer_ref(g.frames_ctx());
+        },
+        None => enc.set_format(pixel_format(cfg.chroma)),
+    }
     enc.set_time_base(TB_US);
     enc.set_frame_rate(Some(ff::Rational(m.fps_num as i32, m.fps_den as i32)));
     enc.set_bit_rate(cfg.bitrate as usize);
@@ -111,22 +122,34 @@ pub fn run(
     params: Arc<StreamParams>,
     mut sink: impl FnMut(EncodedPacket),
 ) -> Result<()> {
-    let mut enc = open(&cfg)?;
+    // The CUDA path falls back to system-memory frames if NVENC won't open with it.
+    let (mut enc, gpu) = match cfg.gpu.as_deref() {
+        Some(g) => match open(&cfg, Some(g)) {
+            Ok(enc) => (enc, cfg.gpu.clone()),
+            Err(e) => {
+                tracing::warn!("NVENC with CUDA frames failed, using system memory: {e:#}");
+                (open(&cfg, None)?, None)
+            }
+        },
+        None => (open(&cfg, None)?, None),
+    };
     *params.video.lock() = Some(SendParams(super::params_of(&enc)));
     tracing::info!(
-        "video encoder {} {} {} {} @ {:.1} Mbps (preset {})",
+        "video encoder {} {} {} {} @ {:.1} Mbps (preset {}, {} frames)",
         cfg.codec.nvenc_name(),
         cfg.mode,
         cfg.chroma.label(),
         cfg.color.label(),
         cfg.bitrate as f64 / 1e6,
-        preset_for(&cfg.mode)
+        preset_for(&cfg.mode),
+        if gpu.is_some() { "CUDA" } else { "system memory" }
     );
 
     let (w, h) = (cfg.mode.width, cfg.mode.height);
     let mut frame = ff::frame::Video::new(pixel_format(cfg.chroma), w, h);
     let mut last_pts = i64::MIN;
     let mut pkt = ff::Packet::empty();
+    let mut scratch = Vec::new();
 
     for vf in rx.iter() {
         if vf.width != w || vf.height != h || vf.chroma != cfg.chroma {
@@ -139,6 +162,41 @@ pub fn run(
             );
             continue;
         }
+        let idr = force_idr.swap(false, Ordering::AcqRel);
+        let kind = if idr { ff::picture::Type::I } else { ff::picture::Type::None };
+        let pts = vf.pts_us.max(last_pts + 1);
+        last_pts = pts;
+
+        if let Some(cuda) = gpu.as_deref() {
+            // A new reference to the CUDA frame (uploaded by the capture thread, or here if
+            // that upload didn't happen); NVENC keeps it until it has read the frame.
+            let prepared = crate::perf::ENCODE_PREP.time(|| -> Result<ff::frame::Video> {
+                let uploaded;
+                let src = match vf.gpu.get() {
+                    Some(g) => g,
+                    None => {
+                        uploaded = cuda.upload(&vf, &mut scratch)?;
+                        &uploaded
+                    }
+                };
+                let f = unsafe { ff::ffi::av_frame_clone(src.as_ptr()) };
+                if f.is_null() {
+                    anyhow::bail!("av_frame_clone failed");
+                }
+                Ok(unsafe { ff::frame::Video::wrap(f) })
+            });
+            let mut f = prepared?;
+            f.set_pts(Some(pts));
+            f.set_kind(kind);
+            crate::perf::ENCODE_SEND.time(|| -> Result<()> {
+                enc.send_frame(&f).context("send_frame")?;
+                drain(&mut enc, &mut pkt, &mut sink);
+                Ok(())
+            })?;
+            continue;
+        }
+
+        let copy_started = std::time::Instant::now();
         unsafe {
             ff::ffi::av_frame_make_writable(frame.as_mut_ptr());
         }
@@ -168,14 +226,15 @@ pub fn run(
             }
         }
 
-        let pts = vf.pts_us.max(last_pts + 1);
-        last_pts = pts;
+        crate::perf::ENCODE_PREP.add(copy_started.elapsed());
         frame.set_pts(Some(pts));
-        let idr = force_idr.swap(false, Ordering::AcqRel);
-        frame.set_kind(if idr { ff::picture::Type::I } else { ff::picture::Type::None });
+        frame.set_kind(kind);
 
-        enc.send_frame(&frame).context("send_frame")?;
-        drain(&mut enc, &mut pkt, &mut sink);
+        crate::perf::ENCODE_SEND.time(|| -> Result<()> {
+            enc.send_frame(&frame).context("send_frame")?;
+            drain(&mut enc, &mut pkt, &mut sink);
+            Ok(())
+        })?;
     }
 
     let _ = enc.send_eof();

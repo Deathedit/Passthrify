@@ -159,6 +159,10 @@ pub struct Config {
     pub frame_gen_multiplier: u32,
     /// Folder with NVVideoEffects.dll etc.; None = search the usual install locations.
     pub frame_gen_dir: Option<PathBuf>,
+
+    /// Upload each captured frame to CUDA once and encode from there (NVENC and frame
+    /// generation share it). Off = the encoder takes system-memory frames as before.
+    pub gpu_frames: bool,
 }
 
 impl Default for Config {
@@ -203,6 +207,7 @@ impl Default for Config {
             frame_gen_quality: crate::vfg::Quality::Medium,
             frame_gen_multiplier: 2,
             frame_gen_dir: None,
+            gpu_frames: true,
         }
     }
 }

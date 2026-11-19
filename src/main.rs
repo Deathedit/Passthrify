@@ -7,10 +7,12 @@ mod color;
 mod config;
 mod encode;
 mod game_fps;
+mod gpu;
 mod hotkeys;
 mod mux;
 mod notify;
 mod packets;
+mod perf;
 mod pipeline;
 mod recorder;
 mod replay;
@@ -40,12 +42,15 @@ USAGE:
   passthrify --check-update [--repo OWNER/NAME] [--channel stable|prerelease]
                                 check GitHub for a newer release
   passthrify --selftest [SECS] [--out DIR] [--mode WxH@FPS] [--chroma 420|422|444]
-             [--codec hevc|h264|av1] [--cycle-modes]
+             [--codec hevc|h264|av1] [--cycle-modes] [--no-gpu-frames]
                                 run capture+encode headless for SECS (default 15), then
                                 save a replay, a screenshot and a short recording
   passthrify --frame-gen-test [--vfg-dir DIR] [--out DIR]
                                 load NVIDIA Video Frame Generation, interpolate synthetic
                                 1080p/4K frames, report timings and write PNGs
+  passthrify --gpu-test [--vfg-dir DIR]
+                                encode synthetic frames from system memory and from CUDA
+                                frames, report per-frame timings (no capture card needed)
 ";
 
 fn main() -> Result<()> {
@@ -114,8 +119,15 @@ fn main() -> Result<()> {
                 "av1" => config::Codec::Av1,
                 _ => config::Codec::Hevc,
             }),
+            no_gpu_frames: args.iter().any(|a| a == "--no-gpu-frames"),
         };
         return selftest(secs, out, cycle, overrides);
+    }
+    if args.iter().any(|a| a == "--gpu-test") {
+        attach_console();
+        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|j| args.get(j + 1)).cloned();
+        let dir = arg("--vfg-dir").map(std::path::PathBuf::from).or(Config::load().frame_gen_dir);
+        return gpu::self_test(dir.as_deref());
     }
     if args.iter().any(|a| a == "--frame-gen-test") {
         attach_console();
@@ -236,6 +248,7 @@ struct SelftestOverrides {
     chroma: Option<config::Chroma>,
     mode: Option<config::ModePref>,
     codec: Option<config::Codec>,
+    no_gpu_frames: bool,
 }
 
 fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) -> Result<()> {
@@ -253,6 +266,9 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
     if let Some(c) = ov.codec {
         cfg.codec = c;
     }
+    if ov.no_gpu_frames {
+        cfg.gpu_frames = false;
+    }
     cfg.windows_notifications = false;
     cfg.replay_seconds = cfg.replay_seconds.min(secs.saturating_sub(5).max(5) as u32);
     println!("output dir: {}", cfg.output_dir.display());
@@ -261,6 +277,7 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
     let st = &shared.status;
 
     let start = Instant::now();
+    let cpu0 = gpu::process_cpu_ms();
     let mut recorded = false;
     while start.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_secs(1));
@@ -293,6 +310,7 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
             st.error.lock(),
         );
     }
+    println!("process CPU: {:.1}% of one core over {secs} s", (gpu::process_cpu_ms() - cpu0) / (start.elapsed().as_secs_f64() * 10.0));
     pipeline.send(Command::ToggleRecord);
     pipeline.send(Command::SaveReplay);
     pipeline.send(Command::Screenshot);

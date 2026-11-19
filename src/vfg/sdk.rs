@@ -478,24 +478,35 @@ impl Interpolator {
         let w = frame.width;
         let (cw, _) = frame.chroma_size();
         let cur = self.next;
-        let (mut y, mut uv) = (frame.y_plane().as_ptr(), frame.uv_plane().as_ptr());
-        let mut space = NVCV_CPU;
-        if let Some(dev) = &self.staging {
-            self.sdk.memcpy(dev.ptr, frame.data.as_ptr().cast(), frame.data.len(), CUDA_HOST_TO_DEVICE)?;
-            y = dev.ptr.cast();
-            uv = unsafe { y.add((w * frame.height) as usize) };
-            space = NVCV_GPU;
+        // Source planes: the capture thread's CUDA copy when there is one, otherwise our own
+        // upload into the staging buffer, otherwise CPU memory.
+        let (y, y_pitch, u, v, uv_pixel_bytes, uv_pitch, space);
+        if let Some(g) = frame.gpu.get() {
+            let p = g.planes();
+            (y, y_pitch, u, v, uv_pixel_bytes, uv_pitch, space) =
+                (p.y, p.y_pitch, p.u, p.v, p.uv_pixel_bytes, p.uv_pitch, NVCV_GPU);
+        } else {
+            let (mut py, mut puv) = (frame.y_plane().as_ptr(), frame.uv_plane().as_ptr());
+            let mut s = NVCV_CPU;
+            if let Some(dev) = &self.staging {
+                self.sdk.memcpy(dev.ptr, frame.data.as_ptr().cast(), frame.data.len(), CUDA_HOST_TO_DEVICE)?;
+                py = dev.ptr.cast();
+                puv = unsafe { py.add((w * frame.height) as usize) };
+                s = NVCV_GPU;
+            }
+            (y, y_pitch, u, v, uv_pixel_bytes, uv_pitch, space) =
+                (py, w as i32, puv, unsafe { puv.add(1) }, 2, (cw * 2) as i32, s);
         }
         self.sdk.check(
             unsafe {
                 (self.sdk.api.TransferFromYUV)(
                     y.cast(),
                     1,
-                    w as i32,
-                    uv.cast(),
-                    uv.add(1).cast(),
-                    2,
-                    (cw * 2) as i32,
+                    y_pitch,
+                    u.cast(),
+                    v.cast(),
+                    uv_pixel_bytes,
+                    uv_pitch,
                     self.yuv_format(),
                     NVCV_U8,
                     self.colorspace(),
@@ -571,7 +582,7 @@ impl Interpolator {
         if let Some(dev) = &self.staging {
             self.sdk.memcpy(host.cast(), dev.ptr, len, CUDA_DEVICE_TO_HOST)?;
         }
-        Ok(VideoFrame { width: w, height: h, chroma: like.chroma, color: like.color, data, pts_us: like.pts_us, seq: 0 })
+        Ok(VideoFrame { width: w, height: h, chroma: like.chroma, color: like.color, data, pts_us: like.pts_us, seq: 0, gpu: Default::default() })
     }
 }
 
