@@ -4,14 +4,14 @@
     offers in Settings › Display (dist\Passthrify-VFG-runtime-<version>.zip + .sha256).
 
 .DESCRIPTION
-    Point -SdkDir at the bin folder of YOUR OWN NVIDIA Video Effects SDK install, downloaded
-    from NVIDIA NGC with the Video Frame Generation feature added (install_feature.ps1). The
-    right to redistribute these files comes from accepting NVIDIA's Maxine SDK license
-    yourself; don't package files copied out of another application.
+    Point -SdkDir at YOUR OWN NVIDIA Video Effects SDK install (its root or bin folder),
+    downloaded from NVIDIA NGC with the Video Frame Generation feature added
+    (install_feature.ps1). Don't package files copied out of another application.
 
-    License conditions to keep (Maxine SDK license, v. April 2021): the files are used only by
-    Passthrify, the app credits NVIDIA (Settings shows "powered by NVIDIA Maxine"), and the
-    runtime isn't put under an open-source license. The zip carries NVIDIA's license notice.
+    Before publishing: SDK 1.3 is under NVIDIA's Software License Agreement and Product-Specific
+    Terms for AI Products (in the SDK's license folder, copied into the zip). Software received
+    through NVIDIA's developer program may not be distributed (section 1.2.8 of the AI terms),
+    so get NVIDIA's written OK (maxinesdk-support@nvidia.com) before uploading the zip.
 
 .EXAMPLE
     .\scripts\package-vfg-runtime.ps1 -SdkDir 'C:\NVIDIA\VFX_SDK\bin'
@@ -70,8 +70,14 @@ foreach ($crt in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
     if (Test-Path $p) { $files += $p }
 }
 
-$version = (Get-Item (Join-Path $SdkDir 'NVVideoEffects.dll')).VersionInfo.ProductVersion
-if (-not $version) { $version = (Get-Item (Join-Path $SdkDir 'NVVideoEffects.dll')).VersionInfo.FileVersion }
+# The SDK's version (1.3.0.0) is in videofx_version.h; the DLL's own version differs.
+$version = $null
+$header = Join-Path (Split-Path $SdkDir) 'videofx_version.h'
+if (Test-Path $header) {
+    $m = Select-String -Path $header -Pattern 'NVIDIA_VIDEOEFFECTS_SDK_VERSION_STRING\s+"([0-9.]+)"' | Select-Object -First 1
+    if ($m) { $version = $m.Matches[0].Groups[1].Value }
+}
+if (-not $version) { $version = (Get-Item (Join-Path $SdkDir 'NVVideoEffects.dll')).VersionInfo.ProductVersion }
 $version = ($version -replace '[^0-9.]', '').Trim('.')
 if (-not $version) { $version = 'unknown' }
 
@@ -110,6 +116,6 @@ $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
 Write-Host "Packaged $zip ($mb MB)" -ForegroundColor Green
 Write-Host "Contents: $((($files | ForEach-Object { Split-Path $_ -Leaf }) + 'NOTICE.txt') -join ', ')"
 Write-Host "`nPublish it once:"
-Write-Host "  gh release create vfg-runtime `"$zip`" `"$zip.sha256`" --title `"NVIDIA frame generation runtime`" --notes `"Optional download for Settings > Display > Frame generation. NVIDIA software under the Maxine SDK license.`" --latest=false"
+Write-Host "  gh release create vfg-runtime `"$zip`" `"$zip.sha256`" --title `"NVIDIA frame generation runtime`" --notes `"Optional download for Settings > Display > Frame generation. NVIDIA software under NVIDIA's license terms (license folder in the zip).`" --latest=false"
 Write-Host "Replace it later (delete the old zip asset first if the version changed):"
 Write-Host "  gh release upload vfg-runtime `"$zip`" `"$zip.sha256`" --clobber"
