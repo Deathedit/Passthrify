@@ -9,7 +9,8 @@ name: Build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # Version tags only (v1.2.3): not other tags like vfg-runtime (the frame generation runtime).
+    tags: ["v[0-9]*"]
   pull_request:
   workflow_dispatch:
 
