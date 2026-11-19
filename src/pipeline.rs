@@ -90,6 +90,8 @@ pub struct Shared {
     pub status: Status,
     pub ring: Arc<PassRing>,
     pub windows_notifications: AtomicBool,
+    /// Preview frame generation (off unless turned on in Settings › Display).
+    pub frame_gen: crate::vfg::FrameGen,
     toasts: Mutex<Vec<Toast>>,
     repaint: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
@@ -101,6 +103,7 @@ impl Shared {
             status: Status::default(),
             ring: Arc::new(PassRing::new(cfg.volume, cfg.muted)),
             windows_notifications: AtomicBool::new(cfg.windows_notifications),
+            frame_gen: crate::vfg::FrameGen::new(cfg),
             toasts: Mutex::new(Vec::new()),
             repaint: OnceLock::new(),
         }
@@ -114,6 +117,14 @@ impl Shared {
         if let Some(f) = self.repaint.get() {
             f();
         }
+    }
+
+    /// Passes a captured frame on to preview frame generation, if it's on.
+    fn feed_frame_gen(self: &Arc<Self>, frame: &Arc<VideoFrame>) {
+        self.frame_gen.feed(frame, || {
+            let shared = self.clone();
+            spawn("frame-gen", move || crate::vfg::run_worker(&shared.frame_gen, || shared.request_repaint()))
+        });
     }
 
     pub fn notify(&self, text: impl Into<String>, error: bool) {
@@ -275,6 +286,7 @@ impl Session {
                             st.game_fps_x100.store((r.game * 100.0) as u32, Ordering::Relaxed);
                         }
                         sh_frame.latest_frame.store(Some(frame.clone()));
+                        sh_frame.feed_frame_gen(&frame);
                         sh_frame.request_repaint();
                         if let Some(tx) = frame_tx.lock().as_ref() {
                             if let Err(TrySendError::Full(_)) = tx.try_send(frame) {

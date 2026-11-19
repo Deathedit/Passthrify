@@ -151,6 +151,14 @@ pub struct Config {
 
     /// Show the sidebar (controls + settings). Narrow windows start with it hidden anyway.
     pub sidebar_open: bool,
+
+    /// Frame generation for the preview (NVIDIA Video Frame Generation, needs the VFX SDK).
+    pub frame_gen: bool,
+    pub frame_gen_quality: crate::vfg::Quality,
+    /// Output frames per game frame: 2, 3 or 4.
+    pub frame_gen_multiplier: u32,
+    /// Folder with NVVideoEffects.dll etc.; None = search the usual install locations.
+    pub frame_gen_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -191,6 +199,10 @@ impl Default for Config {
             check_updates: true,
             update_repo: None,
             sidebar_open: true,
+            frame_gen: false,
+            frame_gen_quality: crate::vfg::Quality::Medium,
+            frame_gen_multiplier: 2,
+            frame_gen_dir: None,
         }
     }
 }

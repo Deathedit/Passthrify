@@ -79,4 +79,7 @@ Type: files; Name: "{app}\*.dll"
 Type: files; Name: "{app}\*.txt"
 Type: files; Name: "{app}\README.md"
 Type: files; Name: "{app}\.passthrify-write-test"
+; The optional frame generation runtime downloaded from Settings (about 200 MB).
+Type: filesandordirs; Name: "{app}\vfg"
+Type: filesandordirs; Name: "{app}\vfg.download"
 Type: dirifempty; Name: "{app}"

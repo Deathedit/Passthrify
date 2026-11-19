@@ -130,7 +130,7 @@ pub fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Ve
         .max_by(|a, b| a.version.cmp(&b.version))
 }
 
-fn agent() -> Result<ureq::Agent> {
+pub fn agent() -> Result<ureq::Agent> {
     let tls = native_tls::TlsConnector::new().context("initializing TLS")?;
     Ok(ureq::AgentBuilder::new()
         .tls_connector(Arc::new(tls))
@@ -186,28 +186,29 @@ fn find_app_dir(root: &Path) -> Result<PathBuf> {
     bail!("update package doesn't contain passthrify.exe")
 }
 
-/// Downloads, verifies and extracts `rel`. Returns the folder containing the new exe.
-pub fn download_and_stage(rel: &Release, progress: impl Fn(f32)) -> Result<PathBuf> {
-    let agent = agent()?;
-    let dir = staging_root().join(rel.version.to_string());
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-
+/// Downloads `url` to `dest`, checking it against the "<sha256>  name" file at `sha_url`.
+/// `size_hint` is used for progress when the server sends no Content-Length.
+pub fn download_verified(
+    agent: &ureq::Agent,
+    url: &str,
+    sha_url: &str,
+    size_hint: u64,
+    dest: &Path,
+    progress: impl Fn(f32),
+) -> Result<()> {
     let expected = {
-        let text = agent.get(&rel.sha_url).call().map_err(|e| anyhow!("downloading checksum: {e}"))?.into_string()?;
+        let text = agent.get(sha_url).call().map_err(|e| anyhow!("downloading checksum: {e}"))?.into_string()?;
         parse_sha256(&text)?
     };
-
-    let resp = agent.get(&rel.zip_url).call().map_err(|e| anyhow!("downloading update: {e}"))?;
-    let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(rel.zip_size).max(1);
-    let zip_path = dir.join(&rel.zip_name);
-    let mut file = std::fs::File::create(&zip_path)?;
+    let resp = agent.get(url).call().map_err(|e| anyhow!("downloading: {e}"))?;
+    let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(size_hint).max(1);
+    let mut file = std::fs::File::create(dest)?;
     let mut reader = resp.into_reader();
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut done = 0u64;
     loop {
-        let n = reader.read(&mut buf).context("downloading update")?;
+        let n = reader.read(&mut buf).context("downloading")?;
         if n == 0 {
             break;
         }
@@ -218,11 +219,24 @@ pub fn download_and_stage(rel: &Release, progress: impl Fn(f32)) -> Result<PathB
     }
     file.flush()?;
     drop(file);
+    if format!("{:x}", hasher.finalize()) != expected {
+        let _ = std::fs::remove_file(dest);
+        bail!("download is corrupted (checksum mismatch)");
+    }
+    Ok(())
+}
 
-    let actual = format!("{:x}", hasher.finalize());
-    if actual != expected {
+/// Downloads, verifies and extracts `rel`. Returns the folder containing the new exe.
+pub fn download_and_stage(rel: &Release, progress: impl Fn(f32)) -> Result<PathBuf> {
+    let agent = agent()?;
+    let dir = staging_root().join(rel.version.to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    let zip_path = dir.join(&rel.zip_name);
+    if let Err(e) = download_verified(&agent, &rel.zip_url, &rel.sha_url, rel.zip_size, &zip_path, progress) {
         let _ = std::fs::remove_dir_all(&dir);
-        bail!("update download is corrupted (checksum mismatch); nothing was installed");
+        return Err(e.context("nothing was installed"));
     }
 
     let extract = dir.join("extracted");

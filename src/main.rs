@@ -19,6 +19,7 @@ mod svg_raster;
 mod tray;
 mod ui;
 mod updater;
+mod vfg;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -42,6 +43,9 @@ USAGE:
              [--codec hevc|h264|av1] [--cycle-modes]
                                 run capture+encode headless for SECS (default 15), then
                                 save a replay, a screenshot and a short recording
+  passthrify --frame-gen-test [--vfg-dir DIR] [--out DIR]
+                                load NVIDIA Video Frame Generation, interpolate synthetic
+                                1080p/4K frames, report timings and write PNGs
 ";
 
 fn main() -> Result<()> {
@@ -112,6 +116,14 @@ fn main() -> Result<()> {
             }),
         };
         return selftest(secs, out, cycle, overrides);
+    }
+    if args.iter().any(|a| a == "--frame-gen-test") {
+        attach_console();
+        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|j| args.get(j + 1)).cloned();
+        let cfg = Config::load();
+        let dir = arg("--vfg-dir").map(std::path::PathBuf::from).or(cfg.frame_gen_dir);
+        let out = arg("--out").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("passthrify-vfg"));
+        return vfg::self_test(dir.as_deref(), &out);
     }
     run_gui()
 }

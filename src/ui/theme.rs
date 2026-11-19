@@ -61,7 +61,9 @@ fn install_fonts(ctx: &egui::Context) {
     add(&mut fonts, "jbmono-medium", include_bytes!("../../assets/fonts/JetBrainsMono-Medium.ttf"));
 
     // egui's bundled fonts stay as fallbacks (symbols, arrows, emoji).
-    let prop_fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    // JetBrains Mono goes last: it has the arrows (→) that Inter and egui's fonts lack here.
+    let mut prop_fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    prop_fallback.push("jbmono".into());
     let mono_fallback = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
     let with = |first: &str, rest: &[String]| {
         let mut v = vec![first.to_string()];

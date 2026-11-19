@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Stroke};
 use eframe::egui_wgpu;
@@ -577,7 +577,17 @@ impl App {
         let actual_chroma = *st.chroma.lock();
         let color = *st.color.lock();
         let recording = st.recording_since.lock().is_some();
-        let outcome = s.body(ui, &modes, current, actual_chroma, color, &self.hotkey_errors, &self.updater, recording);
+        let outcome = s.body(
+            ui,
+            &modes,
+            current,
+            actual_chroma,
+            color,
+            &self.hotkey_errors,
+            &self.updater,
+            recording,
+            &self.shared.frame_gen,
+        );
         self.settings = Some(s);
         self.handle_settings(if back { SettingsOutcome::Close } else { outcome });
     }
@@ -768,6 +778,29 @@ impl App {
                     );
                 ui.label(text(format!("· {signal:.1} Hz")))
                     .on_hover_text("Signal refresh rate: frames per second arriving from the capture card");
+                let fg = &self.shared.frame_gen;
+                match fg.state() {
+                    crate::vfg::State::Running if fg.output_fps() > 0.0 => {
+                        let ms = fg.gen_ms_x10.load(Ordering::Relaxed) as f32 / 10.0;
+                        ui.label(
+                            RichText::new(format!("→ {:.0} fps", fg.output_fps()))
+                                .font(theme::mono(12.0))
+                                .color(theme::SIGNAL),
+                        )
+                        .on_hover_text(format!(
+                            "Frame generation: frames per second shown in the preview, generated + real. \
+                             {ms:.1} ms of GPU work per game frame."
+                        ));
+                    }
+                    crate::vfg::State::Starting => {
+                        ui.label(text("· frame gen starting…".into()));
+                    }
+                    crate::vfg::State::Failed(_) if fg.enabled() => {
+                        ui.label(RichText::new("· frame gen off").font(theme::mono(12.0)).color(theme::WARNING))
+                            .on_hover_text("Frame generation couldn't start. Details in Settings › Display.");
+                    }
+                    _ => {}
+                }
             });
             let dropped = st.dropped_frames.load(Ordering::Relaxed);
             if dropped > 0 {
@@ -810,7 +843,14 @@ impl App {
             let on = !self.fullscreen;
             self.set_fullscreen(ui.ctx(), on);
         }
-        match self.shared.latest_frame.load_full() {
+        // With frame generation running, its paced stream replaces the live frame.
+        let generated = self.shared.frame_gen.present(Instant::now()).map(|(frame, next)| {
+            if let Some(due) = next {
+                ui.ctx().request_repaint_after(due.saturating_duration_since(Instant::now()));
+            }
+            frame
+        });
+        match generated.or_else(|| self.shared.latest_frame.load_full()) {
             Some(frame) if self.gpu_ok => {
                 let r = letterbox(rect, frame.width, frame.height);
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(r, PreviewCallback { frame }));
@@ -936,6 +976,11 @@ impl App {
                 c.present_mode = crate::config::PresentMode::Mailbox;
                 c.windows_notifications = false;
                 c.sidebar_open = false;
+                // Frame generation applies live (FrameGen::configure).
+                c.frame_gen = false;
+                c.frame_gen_quality = Default::default();
+                c.frame_gen_multiplier = 2;
+                c.frame_gen_dir = None;
             }
             a != b
         };
@@ -950,6 +995,7 @@ impl App {
         self.cfg = cfg;
         self.cfg.save();
         self.shared.windows_notifications.store(self.cfg.windows_notifications, Ordering::Relaxed);
+        self.shared.frame_gen.configure(&self.cfg);
         if let Some(h) = self.hotkeys.as_mut() {
             self.hotkey_errors = h.apply(&self.cfg);
         }

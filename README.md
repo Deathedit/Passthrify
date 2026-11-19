@@ -51,6 +51,28 @@ same folder. The tray icon offers the same actions plus show/hide.
 
 Close **Elgato 4K Capture Utility** / OBS first: the card can only be opened by one app.
 
+### Frame generation (experimental)
+
+Settings › Display › **Frame generation** adds AI-generated frames between the game's frames in
+the preview, using NVIDIA's Video Frame Generation (VFG) effect: a 30 fps game shows at 60, a
+60 fps game at 120 (2x), up to 4x. Only the preview changes; recordings, replays and screenshots
+keep the real frames.
+
+- Needs an RTX 40/50 GPU and NVIDIA's frame generation runtime. It isn't in the main download
+  (about 200 MB); Settings offers **Download runtime**, which installs it into a `vfg` folder
+  next to the exe (or `%LOCALAPPDATA%\Passthrify\vfg`). It's NVIDIA software under the
+  [NVIDIA Maxine SDK license](https://developer.nvidia.com/downloads/maxine-sdk-license).
+  An NVIDIA Video Effects SDK install works too: Passthrify looks in `frame_gen_dir` from
+  config.toml, then `PASSTHRIFY_VFG_DIR`, `NV_VIDEO_EFFECTS_PATH`, `VFXSDK_ROOT` (and their `bin`),
+  the `vfg` folders and `Program Files\NVIDIA Corporation\NVIDIA Video Effects`.
+- Repeated captured frames (a 30 fps game in a 60 Hz signal) are skipped, so it interpolates
+  between the game's own frames, and the output is paced from their timing.
+- The real frame is shown about half a game frame later than without it (8 ms at 60 fps,
+  2x), plus the GPU time. Your monitor needs a refresh rate at least as high as the output.
+- The status bar shows the output rate (`→ 120 fps`, hover for the GPU time per frame).
+- `passthrify --frame-gen-test` checks the SDK without a capture card: it interpolates a
+  moving square at 1080p and 4K, prints timings and writes PNGs.
+
 ### CLI
 
 ```
@@ -126,6 +148,12 @@ Settings → **Updates** checks GitHub Releases at startup (can be turned off) o
 
 **Cutting a release:** bump `version` in Cargo.toml, commit, then `git tag v0.2.0` and push the
 tag. A version with a suffix (`0.2.0-beta.1`) is published as a pre-release.
+
+**Frame generation runtime:** the optional download is a zip on a release tagged `vfg-runtime`
+(not a version, so the updater ignores it). Build it from your own NVIDIA Video Effects SDK
+install (NGC, with the Video Frame Generation feature) and publish it once:
+`.\scripts\package-vfg-runtime.ps1 -SdkDir <sdk>\bin`, then the `gh release create` line it
+prints.
 
 **Dev builds:** every push to `main` publishes a pre-release `v<next>-dev.<commits>`, where `<next>`
 is the Cargo.toml version, or its next patch if that version is already tagged, and

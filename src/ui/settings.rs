@@ -63,12 +63,18 @@ impl Section {
             Section::Replay if cfg.replay_enabled => format!("{} s · {}", cfg.replay_seconds, cfg.codec.short_label()),
             Section::Replay => "Replay off".into(),
             Section::Hotkeys => pretty_hotkey(&cfg.hotkey_save_replay),
-            Section::Display => match cfg.present_mode {
-                PresentMode::Mailbox => "Mailbox",
-                PresentMode::Immediate => "Immediate",
-                PresentMode::Fifo => "VSync",
+            Section::Display => {
+                let present = match cfg.present_mode {
+                    PresentMode::Mailbox => "Mailbox",
+                    PresentMode::Immediate => "Immediate",
+                    PresentMode::Fifo => "VSync",
+                };
+                if cfg.frame_gen {
+                    format!("Frame gen x{} · {present}", cfg.frame_gen_multiplier)
+                } else {
+                    present.into()
+                }
             }
-            .into(),
             Section::Updates => updater::current_version().to_string(),
         }
     }
@@ -151,6 +157,7 @@ impl SettingsUi {
         hotkey_errors: &[String],
         updater: &Arc<Updater>,
         recording: bool,
+        frame_gen: &crate::vfg::FrameGen,
     ) -> SettingsOutcome {
         match self.section {
             Section::Capture => self.capture_card(ui, modes, current, actual_chroma, color, recording),
@@ -161,7 +168,7 @@ impl SettingsUi {
                 }
             }
             Section::Hotkeys => self.hotkeys_card(ui, hotkey_errors),
-            Section::Display => self.display_card(ui),
+            Section::Display => self.display_card(ui, frame_gen),
             Section::Updates => self.updates_card(ui, updater, recording),
         }
         SettingsOutcome::Open
@@ -217,6 +224,10 @@ impl SettingsUi {
             Section::Display => {
                 d.windows_notifications = def.windows_notifications;
                 d.present_mode = def.present_mode;
+                d.frame_gen = def.frame_gen;
+                d.frame_gen_quality = def.frame_gen_quality;
+                d.frame_gen_multiplier = def.frame_gen_multiplier;
+                d.frame_gen_dir = def.frame_gen_dir;
             }
             Section::Updates => {
                 d.update_channel = def.update_channel;
@@ -467,9 +478,11 @@ impl SettingsUi {
         }
     }
 
-    fn display_card(&mut self, ui: &mut egui::Ui) {
+    fn display_card(&mut self, ui: &mut egui::Ui, frame_gen: &crate::vfg::FrameGen) {
         let d = &mut self.draft;
         section_body(ui, |ui| {
+            frame_gen_fields(ui, d, frame_gen);
+            ui.add_space(14.0);
             theme::toggle_row(ui, "Windows notification when a clip is saved", &mut d.windows_notifications);
             ui.add_space(10.0);
             theme::field_label(ui, "Presentation");
@@ -759,6 +772,100 @@ fn release_notes(ui: &mut egui::Ui, md: &str) {
             ui.add(egui::Label::new(RichText::new(clean(t)).size(12.5).color(theme::TEXT2)).wrap());
         }
     }
+}
+
+/// Frame generation toggle, output rate, model and where the SDK was found.
+fn frame_gen_fields(ui: &mut egui::Ui, d: &mut Config, fg: &crate::vfg::FrameGen) {
+    use crate::vfg::{sdk, Quality, State};
+    let small = |s: &str| RichText::new(s).size(12.0).color(theme::TEXT3);
+    let wrap = |ui: &mut egui::Ui, t: RichText| ui.add(egui::Label::new(t).wrap());
+    theme::toggle_row(ui, "Frame generation (NVIDIA VFG)", &mut d.frame_gen);
+    wrap(
+        ui,
+        small(
+            "Adds AI-generated frames between the game's frames in the preview. Recordings, replays \
+             and screenshots keep the real frames. Adds about half a game frame of delay.",
+        ),
+    );
+    ui.add_enabled_ui(d.frame_gen, |ui| {
+        let w = ui.available_width();
+        ui.add_space(4.0);
+        theme::field_label(ui, "Output");
+        let mult_label = |m: u32| format!("x{m}");
+        egui::ComboBox::from_id_salt("s_fg_mult").selected_text(mult_label(d.frame_gen_multiplier)).width(w).show_ui(
+            ui,
+            |ui| {
+                for m in 2..=4 {
+                    ui.selectable_value(&mut d.frame_gen_multiplier, m, mult_label(m));
+                }
+            },
+        );
+        theme::field_label(ui, "Model");
+        egui::ComboBox::from_id_salt("s_fg_quality").selected_text(d.frame_gen_quality.label()).width(w).show_ui(ui, |ui| {
+            for q in Quality::ALL {
+                ui.selectable_value(&mut d.frame_gen_quality, q, q.label());
+            }
+        });
+        match sdk::find_runtime(d.frame_gen_dir.as_deref()) {
+            Some(found) => {
+                wrap(ui, small(&format!("Found: {}", found.display())));
+            }
+            None => runtime_download(ui, d, fg),
+        }
+        match fg.state() {
+            State::Failed(e) if d.frame_gen => {
+                wrap(ui, RichText::new(format!("Couldn't start: {e}")).size(12.0).color(theme::WARNING));
+            }
+            State::Starting => {
+                wrap(ui, small("Loading the model…"));
+            }
+            _ => {}
+        }
+    });
+}
+
+/// "Not found" with a button to download NVIDIA's runtime (needs an RTX 40/50 GPU).
+fn runtime_download(ui: &mut egui::Ui, d: &Config, fg: &crate::vfg::FrameGen) {
+    use crate::vfg::runtime::DownloadState;
+    let note = |ui: &mut egui::Ui, text: String, color| ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).wrap());
+    match fg.download_state() {
+        DownloadState::Downloading(progress) => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Downloading NVIDIA runtime…").size(12.0).color(egui::Color32::WHITE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{:.0}%", progress * 100.0)).font(theme::mono(11.0)).color(egui::Color32::WHITE),
+                    );
+                });
+            });
+            let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), egui::Sense::hover());
+            ui.painter().rect_filled(bar, 3, theme::LINE);
+            let mut fill = bar;
+            fill.set_width(bar.width() * progress.clamp(0.0, 1.0));
+            ui.painter().rect_filled(fill, 3, theme::SIGNAL);
+            return;
+        }
+        DownloadState::Done(dir) => {
+            // Installed, but find_runtime prefers a frame_gen_dir set in config.toml.
+            note(ui, format!("Installed to {}.", dir.display()), theme::TEXT3);
+            return;
+        }
+        DownloadState::Error(e) => {
+            note(ui, format!("Download failed: {e}"), theme::WARNING);
+        }
+        DownloadState::Idle => {}
+    }
+    note(ui, "NVIDIA's frame generation runtime isn't installed (needs an RTX 40 or 50 series GPU).".into(), theme::WARNING);
+    let repo = crate::updater::repo(d.update_repo.as_deref());
+    ui.add_enabled_ui(repo.is_some(), |ui| {
+        let click = theme::button(ui, Kind::Primary, Some(icons::DOWNLOAD), "Download runtime", Some("about 200 MB"));
+        if click.clicked() {
+            if let Some(repo) = repo.clone() {
+                let ctx = ui.ctx().clone();
+                fg.start_download(repo, move || ctx.request_repaint());
+            }
+        }
+    });
 }
 
 /// Path text field + "Open" button. Returns true when Open was clicked.
