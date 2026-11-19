@@ -60,11 +60,13 @@ keep the real frames.
 
 - Needs an RTX 40/50 GPU and NVIDIA's frame generation runtime. It isn't in the main download
   (about 200 MB); Settings offers **Download runtime**, which installs it into a `vfg` folder
-  next to the exe (or `%LOCALAPPDATA%\Passthrify\vfg`). It's NVIDIA software under the
-  [NVIDIA Maxine SDK license](https://developer.nvidia.com/downloads/maxine-sdk-license).
-  An NVIDIA Video Effects SDK install works too: Passthrify looks in `frame_gen_dir` from
-  config.toml, then `PASSTHRIFY_VFG_DIR`, `NV_VIDEO_EFFECTS_PATH`, `VFXSDK_ROOT` (and their `bin`),
-  the `vfg` folders and `Program Files\NVIDIA Corporation\NVIDIA Video Effects`.
+  next to the exe (or `%LOCALAPPDATA%\Passthrify\vfg`). It's NVIDIA software under NVIDIA's
+  license terms.
+  An NVIDIA Video Effects SDK install works too. The default place is the `vfg` folder next to
+  the exe: copy the SDK's `bin` and `features` folders into it (`vfg\bin`, `vfg\features`).
+  After that Passthrify looks in `frame_gen_dir` from config.toml, `PASSTHRIFY_VFG_DIR`,
+  `NV_VIDEO_EFFECTS_PATH`, `VFXSDK_ROOT` (and their `bin`), `%LOCALAPPDATA%\Passthrify\vfg` and
+  `Program Files\NVIDIA Corporation\NVIDIA Video Effects`.
 - Repeated captured frames (a 30 fps game in a 60 Hz signal) are skipped, so it interpolates
   between the game's own frames, and the output is paced from their timing.
 - The real frame is shown about half a game frame later than without it (8 ms at 60 fps,

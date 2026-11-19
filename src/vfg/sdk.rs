@@ -134,9 +134,14 @@ pub struct Sdk {
 unsafe impl Send for Sdk {}
 unsafe impl Sync for Sdk {}
 
-/// Folders to look in, most specific first.
+/// Folders to look in, in order. The default is a `vfg` folder next to the exe, holding either
+/// the runtime download (DLLs at its top level) or a copied SDK (`vfg\bin` + `vfg\features`).
 pub fn candidate_dirs(configured: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        dirs.push(exe_dir.join("vfg"));
+        dirs.push(exe_dir.join("vfg").join("bin"));
+    }
     if let Some(p) = configured {
         dirs.push(p.to_path_buf());
         dirs.push(p.join("bin"));
@@ -147,9 +152,6 @@ pub fn candidate_dirs(configured: Option<&Path>) -> Vec<PathBuf> {
             dirs.push(p.join("bin"));
             dirs.push(p);
         }
-    }
-    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
-        dirs.push(exe_dir.join("vfg"));
     }
     dirs.push(super::runtime::local_dir());
     if let Some(pf) = std::env::var_os("ProgramFiles") {
@@ -162,11 +164,41 @@ pub fn candidate_dirs(configured: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-/// First folder holding all three DLLs.
+/// The frame generation feature DLL for an SDK `bin` folder: next to the core DLLs (the
+/// runtime download), or where NVIDIA's install_feature.ps1 puts it
+/// (`<sdk>\features\nvvfxvideoframegeneration\...`).
+pub fn feature_dll(dir: &Path) -> Option<PathBuf> {
+    let flat = dir.join(FEATURE_DLL);
+    if flat.is_file() {
+        return Some(flat);
+    }
+    fn search(dir: &Path, depth: u32) -> Option<PathBuf> {
+        let entries: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+        let hit = |p: &&PathBuf| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(FEATURE_DLL));
+        if let Some(p) = entries.iter().find(hit) {
+            return Some(p.clone());
+        }
+        if depth == 0 {
+            return None;
+        }
+        entries.iter().filter(|p| p.is_dir()).find_map(|p| search(p, depth - 1))
+    }
+    search(&dir.parent()?.join("features").join("nvvfxvideoframegeneration"), 3)
+}
+
+/// First folder holding the core DLLs, with the frame generation feature installed.
 pub fn find_runtime(configured: Option<&Path>) -> Option<PathBuf> {
     candidate_dirs(configured)
         .into_iter()
-        .find(|d| [CORE_DLL, IMAGE_DLL, FEATURE_DLL].iter().all(|f| d.join(f).is_file()))
+        .find(|d| [CORE_DLL, IMAGE_DLL].iter().all(|f| d.join(f).is_file()) && feature_dll(d).is_some())
+}
+
+/// The CUDA runtime DLL in `dir`, if any.
+fn cudart_in(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| {
+        let n = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        n.starts_with("cudart64_") && n.ends_with(".dll")
+    })
 }
 
 /// Loads (once per folder) the SDK from the first folder that has it.
@@ -205,7 +237,8 @@ impl Sdk {
         let _ = SetDllDirectoryW(&HSTRING::from(dir));
         let image = open_lib(&dir.join(IMAGE_DLL))?;
         let core = open_lib(&dir.join(CORE_DLL))?;
-        let _feature = open_lib(&dir.join(FEATURE_DLL))?;
+        let feature_path = feature_dll(dir).ok_or_else(|| anyhow!("{FEATURE_DLL} not found for {}", dir.display()))?;
+        let _feature = open_lib(&feature_path)?;
         let api = Api {
             GetVersion: sym(core, "NvVFX_GetVersion")?,
             CreateEffect: sym(core, "NvVFX_CreateEffect")?,
@@ -221,14 +254,10 @@ impl Sdk {
             TransferToYUV: sym(image, "NvCVImage_TransferToYUV")?,
             ErrorString: sym(image, "NvCV_GetErrorStringFromCode").or_else(|_| sym(core, "NvCV_GetErrorStringFromCode")).ok(),
         };
-        let cuda = std::fs::read_dir(dir)
-            .ok()
-            .and_then(|rd| {
-                rd.flatten().map(|e| e.path()).find(|p| {
-                    let n = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-                    n.starts_with("cudart64_") && n.ends_with(".dll")
-                })
-            })
+        // Any cudart works: device memory from the runtime API lives in the GPU's primary
+        // context, which the SDK uses too.
+        let cuda = cudart_in(dir)
+            .or_else(|| feature_path.parent().and_then(cudart_in))
             .and_then(|p| open_lib(&p).ok())
             .and_then(|lib| {
                 Some(Cuda {
@@ -551,5 +580,34 @@ impl Drop for Interpolator {
         if !self.effect.is_null() {
             unsafe { (self.sdk.api.DestroyEffect)(self.effect) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vfg_next_to_the_exe_comes_first() {
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let dirs = candidate_dirs(Some(Path::new(r"D:\elsewhere")));
+        assert_eq!(dirs[0], exe_dir.join("vfg"));
+        assert_eq!(dirs[1], exe_dir.join("vfg").join("bin"));
+        assert_eq!(dirs[2], PathBuf::from(r"D:\elsewhere"), "then the config override");
+    }
+
+    #[test]
+    fn finds_the_feature_in_an_sdk_layout() {
+        let root = std::env::temp_dir().join(format!("pt-sdk-layout-{}", std::process::id()));
+        let bin = root.join("bin");
+        let feature_dir = root.join("features").join("nvvfxvideoframegeneration").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&feature_dir).unwrap();
+        assert_eq!(feature_dll(&bin), None);
+        std::fs::write(feature_dir.join(FEATURE_DLL), b"x").unwrap();
+        assert_eq!(feature_dll(&bin), Some(feature_dir.join(FEATURE_DLL)));
+        std::fs::write(bin.join(FEATURE_DLL), b"x").unwrap();
+        assert_eq!(feature_dll(&bin), Some(bin.join(FEATURE_DLL)), "a copy next to the core wins");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
