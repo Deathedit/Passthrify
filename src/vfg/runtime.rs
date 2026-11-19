@@ -96,7 +96,14 @@ pub fn download(repo: &str, progress: impl Fn(f32)) -> Result<PathBuf> {
 }
 
 fn install_from(agent: &ureq::Agent, asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result<PathBuf> {
-    let work = std::env::temp_dir().join("passthrify-vfg-download");
+    // One work folder per install target, so two installs (or parallel tests) never share it.
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        target.hash(&mut h);
+        h.finish()
+    };
+    let work = std::env::temp_dir().join(format!("passthrify-vfg-download-{key:016x}"));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
     let zip_path = work.join(&asset.name);
