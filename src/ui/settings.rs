@@ -780,13 +780,6 @@ fn frame_gen_fields(ui: &mut egui::Ui, d: &mut Config, fg: &crate::vfg::FrameGen
     let small = |s: &str| RichText::new(s).size(12.0).color(theme::TEXT3);
     let wrap = |ui: &mut egui::Ui, t: RichText| ui.add(egui::Label::new(t).wrap());
     theme::toggle_row(ui, "Frame generation (NVIDIA VFG)", &mut d.frame_gen);
-    wrap(
-        ui,
-        small(
-            "Adds AI-generated frames between the game's frames in the preview. Recordings, replays \
-             and screenshots keep the real frames. Adds about half a game frame of delay.",
-        ),
-    );
     ui.add_enabled_ui(d.frame_gen, |ui| {
         let w = ui.available_width();
         ui.add_space(4.0);
@@ -807,8 +800,8 @@ fn frame_gen_fields(ui: &mut egui::Ui, d: &mut Config, fg: &crate::vfg::FrameGen
             }
         });
         match sdk::find_runtime(d.frame_gen_dir.as_deref()) {
-            Some(found) => {
-                wrap(ui, small(&format!("Found: {}", found.display())));
+            Some(_) => {
+                wrap(ui, small("Runtime: installed"));
             }
             None => runtime_download(ui, d, fg),
         }
