@@ -1,6 +1,6 @@
 [package]
 name = "passthrify"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Low-latency Elgato capture viewer with ShadowPlay-style instant replay"
 build = "build.rs"

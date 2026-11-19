@@ -39,6 +39,8 @@ pub struct App {
     first_frame: bool,
     /// egui time until which the show-sidebar button stays visible.
     show_button_until: f64,
+    /// egui time of the last mouse movement or click (hides the cursor over the video when idle).
+    cursor_moved_at: f64,
 }
 
 /// Sidebar width, and its gap to the video area's edges.
@@ -48,6 +50,8 @@ const SIDEBAR_INSET: f32 = 8.0;
 const NARROW_WINDOW: f32 = 1180.0;
 /// Seconds without mouse movement before the show-sidebar button fades out.
 const SHOW_BUTTON_IDLE: f64 = 3.0;
+/// Seconds without mouse movement before the cursor over the video hides.
+const CURSOR_IDLE: f64 = 3.0;
 /// Our own title bar (the native one is removed, see `frame.rs`) and its caption buttons.
 const TITLE_BAR_H: f32 = 32.0;
 const CAPTION_BUTTON_W: f32 = 46.0;
@@ -219,6 +223,7 @@ impl App {
             sidebar_before_fullscreen: true,
             first_frame: true,
             show_button_until: 0.0,
+            cursor_moved_at: 0.0,
         };
         // PASSTHRIFY_SETTINGS=capture|audio|replay|hotkeys|display opens Settings on launch
         // (handy for docs and screenshots).
@@ -842,6 +847,20 @@ impl App {
         if resp.double_clicked() {
             let on = !self.fullscreen;
             self.set_fullscreen(ui.ctx(), on);
+        }
+        // Hide the cursor over the video after a few seconds without movement. Only while the
+        // video itself is hovered: over the sidebar, toasts or other UI it stays visible.
+        let now = ui.input(|i| i.time);
+        if ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_down()) {
+            self.cursor_moved_at = now;
+        }
+        if resp.hovered() {
+            let idle = now - self.cursor_moved_at;
+            if idle >= CURSOR_IDLE {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_secs_f64(CURSOR_IDLE - idle));
+            }
         }
         // With frame generation running, its paced stream replaces the live frame.
         let generated = self.shared.frame_gen.present(Instant::now()).map(|(frame, next)| {

@@ -13,7 +13,7 @@ const fn hex(rgb: u32) -> Color32 {
 }
 
 // --- Palette -------------------------------------------------------------------------------
-pub const VOID: Color32 = hex(0x08090C); // video letterbox
+pub const VOID: Color32 = hex(0x000000); // video letterbox: pure black, like the bars on a TV
 pub const BASE: Color32 = hex(0x0D0F13); // window ground
 pub const SURFACE: Color32 = hex(0x13161B); // toolbar, status bar, cards
 pub const RAISED: Color32 = hex(0x1A1E25); // buttons, inputs, toasts
