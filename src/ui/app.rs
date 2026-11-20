@@ -564,11 +564,6 @@ impl App {
                 c
             })
             .inner;
-        if recording {
-            ui.label(
-                RichText::new("Stop recording to change chroma, resolution, frame rate or codec.").size(12.0).color(theme::TEXT3),
-            );
-        }
         if changed {
             let mut c = self.cfg.clone();
             c.video_mode = pref;

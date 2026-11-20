@@ -302,12 +302,13 @@ impl SettingsUi {
                 });
             });
             ui.add_space(4.0);
-            let note = if recording {
-                "Stop recording to change chroma, resolution or frame rate."
-            } else {
-                "Resolution and frame-rate lists only show modes that deliver the selected chroma."
-            };
-            ui.label(RichText::new(note).size(12.0).color(theme::TEXT3));
+            if !recording {
+                ui.label(
+                    RichText::new("Resolution and frame-rate lists only show modes that deliver the selected chroma.")
+                        .size(12.0)
+                        .color(theme::TEXT3),
+                );
+            }
             ui.add_space(6.0);
 
             theme::field_label(ui, "Input range");
@@ -495,15 +496,7 @@ impl SettingsUi {
             theme::segmented(ui, &mut d.stream_fps, &[(30, "30 fps", true), (60, "60 fps", true)]);
             ui.add_space(6.0);
             theme::field_label(ui, "Video bitrate");
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut d.stream_bitrate_kbps).range(1000..=50_000).speed(50.0).suffix(" kbps"));
-                let tip = match d.stream_service {
-                    StreamService::Twitch => "Twitch: up to about 8000",
-                    StreamService::YouTube => "YouTube 1080p60: about 12000",
-                    StreamService::Custom => "",
-                };
-                ui.label(RichText::new(tip).font(theme::mono(11.0)).color(theme::TEXT3));
-            });
+            ui.add(egui::DragValue::new(&mut d.stream_bitrate_kbps).range(1000..=50_000).speed(50.0).suffix(" kbps"));
         });
     }
 
