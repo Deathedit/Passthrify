@@ -599,35 +599,60 @@ impl SettingsUi {
         let d = &mut self.draft;
         let blocker = self.install_blocker.clone();
         section_body(ui, |ui| {
+            let repo = updater::repo(d.update_repo.as_deref());
+            let state = updater.state();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Installed version").color(theme::TEXT2));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(updater::current_version().to_string()).font(theme::mono(13.0)).color(theme::TEXT));
-                });
+                ui.label(RichText::new("Version").color(theme::TEXT2));
+                ui.label(RichText::new(updater::current_version().to_string()).font(theme::mono(13.0)).color(theme::TEXT));
+                let busy = matches!(state, UpdateState::Checking | UpdateState::Downloading { .. } | UpdateState::Restarting);
+                if repo.is_some() && !busy {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, Kind::Secondary, None, "Check now", None).clicked() {
+                            updater.start_check(repo.clone(), d.update_channel, Duration::ZERO);
+                        }
+                    });
+                }
             });
+            // One short status line (an available update gets its own block below).
+            let status = |ui: &mut egui::Ui, icon: Option<((&'static str, &'static [u8]), egui::Color32)>, text: String, color: egui::Color32| {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if let Some((i, c)) = icon {
+                        ui.add(theme::icon_image(i, 14.0, c));
+                    }
+                    ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).wrap());
+                });
+            };
+            match &state {
+                UpdateState::Idle => status(ui, None, "Not checked yet".into(), theme::TEXT3),
+                UpdateState::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Checking…").size(12.0).color(theme::TEXT2));
+                    });
+                }
+                UpdateState::UpToDate { checked } => {
+                    status(ui, Some((icons::CHECK, theme::SUCCESS)), format!("Up to date · checked {checked}"), theme::TEXT2)
+                }
+                UpdateState::Error(e) => status(ui, Some((icons::ALERT, theme::REC)), e.clone(), theme::REC),
+                _ => {}
+            }
             ui.add_space(10.0);
 
             theme::field_label(ui, "Channel");
-            let repo = updater::repo(d.update_repo.as_deref());
             if theme::segmented(
                 ui,
                 &mut d.update_channel,
                 &[(UpdateChannel::Stable, "Stable", true), (UpdateChannel::PreRelease, "Pre-release", true)],
             ) {
-                // Re-check right away so the card reflects the new channel.
+                // Re-check right away so the status reflects the new channel.
                 updater.start_check(repo.clone(), d.update_channel, Duration::ZERO);
             }
-            let hint = match d.update_channel {
-                UpdateChannel::Stable => "Tested releases only.",
-                UpdateChannel::PreRelease => "Betas and release candidates as well: new features sooner, rougher edges.",
-            };
-            ui.label(RichText::new(hint).size(12.0).color(theme::TEXT3));
             ui.add_space(8.0);
-            theme::toggle_row(ui, "Check for updates when Passthrify starts", &mut d.check_updates);
-            ui.add_space(12.0);
+            theme::toggle_row(ui, "Check at startup", &mut d.check_updates);
 
-            // Status + actions.
             if repo.is_none() {
+                ui.add_space(10.0);
                 ui.label(
                     RichText::new("This build has no update source, so it can't check for updates. Official releases include one.")
                         .color(theme::TEXT2),
@@ -639,49 +664,9 @@ impl SettingsUi {
                 );
                 return;
             }
-            let state = updater.state();
-            let check_now = |ui: &mut egui::Ui| {
-                if theme::button(ui, Kind::Secondary, None, "Check now", None).clicked() {
-                    updater.start_check(repo.clone(), d.update_channel, Duration::ZERO);
-                }
-            };
             match &state {
-                UpdateState::Idle => {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Not checked yet.").color(theme::TEXT2));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), check_now);
-                    });
-                }
-                UpdateState::Checking => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Checking GitHub…").color(theme::TEXT2));
-                    });
-                }
-                UpdateState::UpToDate { checked } => {
-                    ui.horizontal_top(|ui| {
-                        ui.add(theme::icon_image(icons::CHECK, 16.0, theme::SUCCESS));
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!(
-                                    "You're up to date ({} channel, checked {checked}).",
-                                    d.update_channel.label()
-                                ))
-                                .color(theme::TEXT),
-                            )
-                            .wrap(),
-                        );
-                    });
-                    ui.horizontal(|ui| check_now(ui));
-                }
-                UpdateState::Error(e) => {
-                    ui.horizontal(|ui| {
-                        ui.add(theme::icon_image(icons::ALERT, 16.0, theme::REC));
-                        ui.add(egui::Label::new(RichText::new(e).color(theme::REC)).wrap());
-                    });
-                    ui.horizontal(|ui| check_now(ui));
-                }
                 UpdateState::Available(rel) | UpdateState::Downloading { release: rel, .. } => {
+                    ui.add_space(12.0);
                     let downloading = matches!(state, UpdateState::Downloading { .. });
                     ui.horizontal_top(|ui| {
                         ui.add(theme::icon_image(icons::DOWNLOAD, 16.0, theme::SIGNAL));
@@ -757,20 +742,13 @@ impl SettingsUi {
                     }
                 }
                 UpdateState::Restarting => {
+                    ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(RichText::new("Installing — Passthrify will restart…").color(theme::TEXT2));
                     });
                 }
-            }
-
-            ui.add_space(10.0);
-            if let Some(r) = &repo {
-                ui.label(
-                    RichText::new(format!("Source: github.com/{r} · downloads are verified with SHA-256"))
-                        .size(11.0)
-                        .color(theme::TEXT3),
-                );
+                _ => {}
             }
         });
     }
