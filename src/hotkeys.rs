@@ -52,6 +52,7 @@ impl Hotkeys {
             (&cfg.hotkey_save_replay, Action::SaveReplay),
             (&cfg.hotkey_toggle_record, Action::ToggleRecord),
             (&cfg.hotkey_screenshot, Action::Screenshot),
+            (&cfg.hotkey_toggle_stream, Action::ToggleStream),
         ] {
             if text.trim().is_empty() {
                 continue;

@@ -225,12 +225,13 @@ impl App {
             show_button_until: 0.0,
             cursor_moved_at: 0.0,
         };
-        // PASSTHRIFY_SETTINGS=capture|audio|replay|hotkeys|display opens Settings on launch
-        // (handy for docs and screenshots).
+        // PASSTHRIFY_SETTINGS=capture|audio|replay|streaming|hotkeys|display opens Settings on
+        // launch (handy for docs and screenshots).
         if let Ok(s) = std::env::var("PASSTHRIFY_SETTINGS") {
             let section = match s.to_ascii_lowercase().as_str() {
                 "audio" => Section::Audio,
                 "replay" => Section::Replay,
+                "streaming" => Section::Streaming,
                 "hotkeys" => Section::Hotkeys,
                 "display" => Section::Display,
                 "updates" => Section::Updates,
@@ -332,7 +333,8 @@ impl App {
 
         // Fixed bands, top-down and bottom-up; the middle scrolls.
         let header = Rect::from_min_size(full.min, egui::vec2(full.width(), 56.0));
-        let actions = Rect::from_min_max(pos2(full.left(), header.bottom()), pos2(full.right(), header.bottom() + 108.0));
+        // Save replay (40) + Record row (36) + Go live row (36), with 8 px gaps and 12 px margins.
+        let actions = Rect::from_min_max(pos2(full.left(), header.bottom()), pos2(full.right(), header.bottom() + 152.0));
         let volume = Rect::from_min_max(pos2(full.left(), full.bottom() - 48.0), full.max);
         let mut bottom = volume.top();
         let update_card = show_update_card.then(|| {
@@ -456,6 +458,8 @@ impl App {
             self.pipeline.send(Command::SaveReplay);
         }
 
+        self.live_button(ui, w);
+
         ui.horizontal(|ui| {
             let rec_hint = pretty_hotkey(&self.cfg.hotkey_toggle_record);
             let rec_w = w - 2.0 * (36.0 + 8.0);
@@ -482,6 +486,33 @@ impl App {
                 self.pipeline.send(Command::OpenOutputFolder);
             }
         });
+    }
+
+    /// Go live / End stream (under Save replay).
+    fn live_button(&mut self, ui: &mut egui::Ui, w: f32) {
+        let live_hint = pretty_hotkey(&self.cfg.hotkey_toggle_stream);
+        let state = self.shared.stream.state.lock().clone();
+        let size = egui::vec2(w, 36.0);
+        let live = match &state {
+            crate::stream::StreamState::Off => {
+                let hint = (!live_hint.is_empty()).then_some(live_hint.as_str());
+                let label = format!("Go live on {}", self.cfg.stream_service.label());
+                theme::wide_button(ui, Kind::Secondary, icons::LIVE, Some(theme::REC), &label, hint, size)
+            }
+            crate::stream::StreamState::Live { since } => {
+                let clock = theme::fmt_clock(since.elapsed().as_secs());
+                theme::wide_button(ui, Kind::Danger, icons::STOP, None, "End stream", Some(&clock), size)
+            }
+            crate::stream::StreamState::Connecting => {
+                theme::wide_button(ui, Kind::Danger, icons::STOP, None, "Connecting… (cancel)", None, size)
+            }
+            crate::stream::StreamState::Reconnecting { .. } => {
+                theme::wide_button(ui, Kind::Danger, icons::STOP, None, "Reconnecting… (end)", None, size)
+            }
+        };
+        if live.on_hover_text(format!("Start / stop streaming ({live_hint}); set it up in Settings › Streaming")).clicked() {
+            self.pipeline.send(Command::ToggleStream);
+        }
     }
 
     /// Capture pickers (2x2, applied immediately) and the settings list.
@@ -756,6 +787,34 @@ impl App {
         }
     }
 
+    /// "LIVE 00:12:03 · 6.1 Mbps" (or connecting / reconnecting) in the status bar.
+    fn stream_status(&self, ui: &mut egui::Ui) {
+        use crate::stream::StreamState;
+        let s = &self.shared.stream;
+        let state = s.state.lock().clone();
+        let (text, color, tip) = match &state {
+            StreamState::Off => return,
+            StreamState::Connecting => ("LIVE connecting…".to_string(), theme::TEXT2, "Connecting to the stream server".to_string()),
+            StreamState::Reconnecting { error } => {
+                ("LIVE reconnecting…".to_string(), theme::REC, format!("Connection lost: {error}. Retrying."))
+            }
+            StreamState::Live { since } => {
+                let mbps = s.kbps.load(Ordering::Relaxed) as f64 / 1000.0;
+                let dropped = s.dropped.load(Ordering::Relaxed);
+                (
+                    format!("LIVE {} · {mbps:.1} Mbps", theme::fmt_clock(since.elapsed().as_secs())),
+                    theme::REC,
+                    format!("Streaming to {}. Frames the stream couldn't keep up with: {dropped}", self.cfg.stream_service.label()),
+                )
+            }
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            theme::dot(ui, color);
+            ui.label(RichText::new(text).font(FontId::new(12.0, theme::mono_medium())).color(color)).on_hover_text(tip);
+        });
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         let st = &self.shared.status;
         let text = |s: String| RichText::new(s).font(theme::mono(12.0)).color(theme::TEXT2);
@@ -772,6 +831,7 @@ impl App {
                     );
                 });
             }
+            self.stream_status(ui);
             let signal = st.fps_x100.load(Ordering::Relaxed) as f32 / 100.0;
             let game = st.game_fps_x100.load(Ordering::Relaxed) as f32 / 100.0;
             ui.horizontal(|ui| {
@@ -836,7 +896,8 @@ impl App {
                 ui.label(text(c.label())).on_hover_text("Input YCbCr matrix and range (Settings > Capture to override)");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(text(format!("Audio: {}", st.audio_in.lock())));
+                // Shortens itself (…) rather than overlapping the items on the left.
+                ui.add(egui::Label::new(text(format!("Audio: {}", st.audio_in.lock()))).truncate());
             });
         });
     }
@@ -873,8 +934,19 @@ impl App {
             Some(frame) if self.gpu_ok => {
                 let r = letterbox(rect, frame.width, frame.height);
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(r, PreviewCallback { frame, target: self.shared.preview_target.clone() }));
+                // REC and LIVE pills in the video's top-left corner, side by side.
+                let mut at = r.min + egui::vec2(16.0, 16.0);
                 if let Some(since) = *self.shared.status.recording_since.lock() {
-                    self.rec_pill(ui, r.min + egui::vec2(16.0, 16.0), since.elapsed().as_secs());
+                    at.x += self.pill(ui, at, "REC", &theme::fmt_clock(since.elapsed().as_secs())) + 8.0;
+                }
+                let live = match &*self.shared.stream.state.lock() {
+                    crate::stream::StreamState::Off => None,
+                    crate::stream::StreamState::Live { since } => Some(theme::fmt_clock(since.elapsed().as_secs())),
+                    crate::stream::StreamState::Connecting => Some("connecting…".to_string()),
+                    crate::stream::StreamState::Reconnecting { .. } => Some("reconnecting…".to_string()),
+                };
+                if let Some(text) = live {
+                    self.pill(ui, at, "LIVE", &text);
                 }
             }
             _ => {
@@ -897,11 +969,11 @@ impl App {
         }
     }
 
-    /// "● REC 00:01:23" pill over the video.
-    fn rec_pill(&self, ui: &egui::Ui, at: egui::Pos2, secs: u64) {
+    /// "● REC 00:01:23" / "● LIVE 00:12:03" pill over the video; returns its width.
+    fn pill(&self, ui: &egui::Ui, at: egui::Pos2, label: &str, value: &str) -> f32 {
         let p = ui.painter();
-        let rec = p.layout_no_wrap("REC".into(), FontId::new(12.0, theme::semibold()), theme::REC);
-        let time = p.layout_no_wrap(theme::fmt_clock(secs), FontId::new(12.0, theme::mono_medium()), theme::TEXT);
+        let rec = p.layout_no_wrap(label.into(), FontId::new(12.0, theme::semibold()), theme::REC);
+        let time = p.layout_no_wrap(value.into(), FontId::new(12.0, theme::mono_medium()), theme::TEXT);
         let w = 10.0 + 7.0 + 6.0 + rec.size().x + 6.0 + time.size().x + 10.0;
         let rect = egui::Rect::from_min_size(at, egui::vec2(w, 24.0));
         p.rect_filled(rect, 12, Color32::from_rgba_unmultiplied(8, 9, 12, 184));
@@ -910,6 +982,7 @@ impl App {
         let x = rect.left() + 23.0;
         p.galley(egui::pos2(x, cy - rec.size().y / 2.0), rec.clone(), theme::REC);
         p.galley(egui::pos2(x + rec.size().x + 6.0, cy - time.size().y / 2.0), time, theme::TEXT);
+        w
     }
 
     fn toasts(&self, ctx: &egui::Context) {
@@ -992,6 +1065,13 @@ impl App {
                 c.hotkey_save_replay.clear();
                 c.hotkey_toggle_record.clear();
                 c.hotkey_screenshot.clear();
+                c.hotkey_toggle_stream.clear();
+                // Read when going live.
+                c.stream_service = crate::config::StreamService::Twitch;
+                c.stream_server.clear();
+                c.stream_height = 0;
+                c.stream_fps = 0;
+                c.stream_bitrate_kbps = 0;
                 c.present_mode = crate::config::PresentMode::Mailbox;
                 c.windows_notifications = false;
                 c.sidebar_open = false;
@@ -1020,6 +1100,8 @@ impl App {
         }
         if restart_needed {
             self.pipeline.send(Command::Apply(Box::new(self.cfg.clone())));
+        } else {
+            self.pipeline.send(Command::SetConfig(Box::new(self.cfg.clone())));
         }
     }
 }

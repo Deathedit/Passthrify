@@ -17,6 +17,8 @@ mod pipeline;
 mod recorder;
 mod replay;
 mod screenshot;
+mod secrets;
+mod stream;
 mod svg_raster;
 mod tray;
 mod ui;
@@ -43,6 +45,7 @@ USAGE:
                                 check GitHub for a newer release
   passthrify --selftest [SECS] [--out DIR] [--mode WxH@FPS] [--chroma 420|422|444]
              [--codec hevc|h264|av1] [--cycle-modes] [--no-gpu-frames]
+             [--stream rtmp://HOST/APP/KEY]
                                 run capture+encode headless for SECS (default 15), then
                                 save a replay, a screenshot and a short recording
   passthrify --frame-gen-test [--vfg-dir DIR] [--out DIR]
@@ -120,6 +123,7 @@ fn main() -> Result<()> {
                 _ => config::Codec::Hevc,
             }),
             no_gpu_frames: args.iter().any(|a| a == "--no-gpu-frames"),
+            stream: arg("--stream"),
         };
         return selftest(secs, out, cycle, overrides);
     }
@@ -249,6 +253,8 @@ struct SelftestOverrides {
     mode: Option<config::ModePref>,
     codec: Option<config::Codec>,
     no_gpu_frames: bool,
+    /// Also stream to this RTMP URL (as a Custom server).
+    stream: Option<String>,
 }
 
 fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) -> Result<()> {
@@ -269,6 +275,11 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
     if ov.no_gpu_frames {
         cfg.gpu_frames = false;
     }
+    let stream = ov.stream.is_some();
+    if let Some(url) = ov.stream {
+        cfg.stream_service = config::StreamService::Custom;
+        cfg.stream_server = url;
+    }
     cfg.windows_notifications = false;
     cfg.replay_seconds = cfg.replay_seconds.min(secs.saturating_sub(5).max(5) as u32);
     println!("output dir: {}", cfg.output_dir.display());
@@ -279,6 +290,10 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
     let start = Instant::now();
     let cpu0 = gpu::process_cpu_ms();
     let mut recorded = false;
+    if stream {
+        // Right away, before capture is up: the hardest start for the stream.
+        pipeline.send(Command::ToggleStream);
+    }
     while start.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_secs(1));
         let t = start.elapsed().as_secs();
@@ -309,8 +324,19 @@ fn selftest(secs: u64, out: Option<String>, cycle: bool, ov: SelftestOverrides) 
             st.audio_in.lock(),
             st.error.lock(),
         );
+        if stream {
+            println!(
+                "       stream: {:?} | {} kbps | dropped {}",
+                *shared.stream.state.lock(),
+                shared.stream.kbps.load(Ordering::Relaxed),
+                shared.stream.dropped.load(Ordering::Relaxed)
+            );
+        }
     }
     println!("process CPU: {:.1}% of one core over {secs} s", (gpu::process_cpu_ms() - cpu0) / (start.elapsed().as_secs_f64() * 10.0));
+    if stream {
+        pipeline.send(Command::ToggleStream);
+    }
     pipeline.send(Command::ToggleRecord);
     pipeline.send(Command::SaveReplay);
     pipeline.send(Command::Screenshot);

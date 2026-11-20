@@ -86,6 +86,7 @@ pub fn create(hwnd: isize, cmd: Sender<Command>) -> Result<Tray> {
     let show = MenuItem::new("Show / hide window", true, None);
     let save = MenuItem::new("Save instant replay", true, None);
     let rec = MenuItem::new("Start / stop recording", true, None);
+    let live = MenuItem::new("Start / stop streaming", true, None);
     let shot = MenuItem::new("Screenshot", true, None);
     let open = MenuItem::new("Open output folder", true, None);
     let quit = MenuItem::new("Quit", true, None);
@@ -94,6 +95,7 @@ pub fn create(hwnd: isize, cmd: Sender<Command>) -> Result<Tray> {
         &PredefinedMenuItem::separator(),
         &save,
         &rec,
+        &live,
         &shot,
         &open,
         &PredefinedMenuItem::separator(),
@@ -112,12 +114,13 @@ pub fn create(hwnd: isize, cmd: Sender<Command>) -> Result<Tray> {
         show.id().clone(),
         save.id().clone(),
         rec.id().clone(),
+        live.id().clone(),
         shot.id().clone(),
         open.id().clone(),
         quit.id().clone(),
     );
     std::thread::Builder::new().name("tray".into()).spawn(move || {
-        let (show, save, rec, shot, open, quit) = ids;
+        let (show, save, rec, live, shot, open, quit) = ids;
         let menu_rx = MenuEvent::receiver();
         let tray_rx = TrayIconEvent::receiver();
         loop {
@@ -131,6 +134,8 @@ pub fn create(hwnd: isize, cmd: Sender<Command>) -> Result<Tray> {
                         Some(Command::SaveReplay)
                     } else if ev.id == rec {
                         Some(Command::ToggleRecord)
+                    } else if ev.id == live {
+                        Some(Command::ToggleStream)
                     } else if ev.id == shot {
                         Some(Command::Screenshot)
                     } else if ev.id == open {

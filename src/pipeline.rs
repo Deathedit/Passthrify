@@ -35,6 +35,9 @@ pub enum Command {
     OpenOutputFolder,
     OpenScreenshotFolder,
     Apply(Box<Config>),
+    /// Settings that don't need a restart (stream settings, hotkeys): just remembered.
+    SetConfig(Box<Config>),
+    ToggleStream,
     Shutdown,
 }
 
@@ -44,6 +47,7 @@ pub enum Action {
     SaveReplay,
     ToggleRecord,
     Screenshot,
+    ToggleStream,
 }
 
 impl From<Action> for Command {
@@ -52,6 +56,7 @@ impl From<Action> for Command {
             Action::SaveReplay => Command::SaveReplay,
             Action::ToggleRecord => Command::ToggleRecord,
             Action::Screenshot => Command::Screenshot,
+            Action::ToggleStream => Command::ToggleStream,
         }
     }
 }
@@ -96,6 +101,8 @@ pub struct Shared {
     /// The preview's GPU frame buffer shared with CUDA (set by the UI once it has one for
     /// the current shape); the capture thread copies each CUDA frame into it.
     pub preview_target: Arc<ArcSwapOption<crate::gpu::PreviewTarget>>,
+    /// Live stream state for the UI.
+    pub stream: Arc<crate::stream::StreamStatus>,
     toasts: Mutex<Vec<Toast>>,
     repaint: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
@@ -109,6 +116,7 @@ impl Shared {
             windows_notifications: AtomicBool::new(cfg.windows_notifications),
             frame_gen: crate::vfg::FrameGen::new(cfg),
             preview_target: Arc::default(),
+            stream: Arc::default(),
             toasts: Mutex::new(Vec::new()),
             repaint: OnceLock::new(),
         }
@@ -194,7 +202,9 @@ impl Drop for Pipeline {
 }
 
 fn control_loop(mut cfg: Config, shared: Arc<Shared>, rx: Receiver<Command>) {
-    let mut session = Session::start(cfg.clone(), shared.clone());
+    // The stream lives outside the session, so applying settings doesn't end it.
+    let mut live = Live { streamer: None, frames: Arc::default() };
+    let mut session = Session::start(cfg.clone(), shared.clone(), live.frames.clone());
     loop {
         select! {
             recv(rx) -> cmd => match cmd {
@@ -203,18 +213,83 @@ fn control_loop(mut cfg: Config, shared: Arc<Shared>, rx: Receiver<Command>) {
                     session.stop();
                     cfg = *new_cfg;
                     shared.windows_notifications.store(cfg.windows_notifications, Ordering::Relaxed);
-                    session = Session::start(cfg.clone(), shared.clone());
+                    session = Session::start(cfg.clone(), shared.clone(), live.frames.clone());
+                    live.attach_audio(&session.bus);
                 }
+                Ok(Command::SetConfig(new_cfg)) => cfg = *new_cfg,
+                Ok(Command::ToggleStream) => live.toggle(&cfg, &shared, &session.bus),
                 Ok(cmd) => session.handle(cmd),
             },
             recv(session.mode_rx) -> m => match m {
                 Ok((mode, chroma, color)) => session.on_mode(mode, chroma, color),
                 Err(_) => session.mode_rx = never(),
             },
-            default(Duration::from_millis(250)) => session.tick(),
+            default(Duration::from_millis(250)) => {
+                session.tick();
+                live.reap(&session.bus);
+            }
         }
     }
+    live.stop(&session.bus);
     session.stop();
+}
+
+/// The live stream, if one is running, and where the capture thread sends it frames.
+struct Live {
+    streamer: Option<crate::stream::Streamer>,
+    frames: Arc<Mutex<Option<Sender<Arc<VideoFrame>>>>>,
+}
+
+impl Live {
+    fn toggle(&mut self, cfg: &Config, shared: &Arc<Shared>, bus: &PacketBus) {
+        if self.streamer.is_some() {
+            return self.stop(bus);
+        }
+        let key = crate::secrets::stream_key(cfg.stream_service).unwrap_or_default();
+        let service = cfg.stream_service;
+        if service != crate::config::StreamService::Custom && key.is_empty() {
+            return shared.notify(format!("Add your {} stream key in Settings › Streaming", service.label()), true);
+        }
+        let url = service.url(&cfg.stream_server, &key);
+        if !url.starts_with("rtmp://") && !url.starts_with("rtmps://") {
+            return shared.notify("Set an rtmp:// or rtmps:// server in Settings › Streaming", true);
+        }
+        let target = crate::stream::StreamTarget {
+            url,
+            height: cfg.stream_height,
+            max_fps: cfg.stream_fps.clamp(1, 120),
+            bitrate_kbps: cfg.stream_bitrate_kbps.clamp(500, 50_000),
+        };
+        tracing::info!("going live on {} ({}p{}, {} kbps)", service.label(), target.height, target.max_fps, target.bitrate_kbps);
+        shared.stream.dropped.store(0, Ordering::Relaxed);
+        let notify_to = shared.clone();
+        let s = crate::stream::Streamer::start(target, shared.stream.clone(), move |text, error| {
+            notify_to.notify(text, error)
+        });
+        *self.frames.lock() = Some(s.frame_sender());
+        self.streamer = Some(s);
+        self.attach_audio(bus);
+        shared.notify(format!("Connecting to {}…", service.label()), false);
+    }
+
+    fn attach_audio(&self, bus: &PacketBus) {
+        bus.set_streamer(self.streamer.as_ref().map(|s| s.audio_sender()));
+    }
+
+    fn stop(&mut self, bus: &PacketBus) {
+        *self.frames.lock() = None;
+        bus.set_streamer(None);
+        if let Some(s) = self.streamer.take() {
+            s.stop();
+        }
+    }
+
+    /// Cleans up after a stream that ended by itself (a fatal error).
+    fn reap(&mut self, bus: &PacketBus) {
+        if self.streamer.as_ref().is_some_and(|s| s.is_finished()) {
+            self.stop(bus);
+        }
+    }
 }
 
 struct Encoders {
@@ -246,7 +321,7 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
 }
 
 impl Session {
-    fn start(cfg: Config, shared: Arc<Shared>) -> Self {
+    fn start(cfg: Config, shared: Arc<Shared>, stream_frames: Arc<Mutex<Option<Sender<Arc<VideoFrame>>>>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let frame_tx: Arc<Mutex<Option<Sender<Arc<VideoFrame>>>>> = Arc::default();
         let audio_tx: Arc<Mutex<Option<Sender<AudioChunk>>>> = Arc::default();
@@ -263,6 +338,7 @@ impl Session {
                 let mut rates = crate::game_fps::FrameRates::default();
                 let mut scratch = Vec::new();
                 let mut upload_failed = false;
+                let stream_frames = stream_frames.clone();
                 video_mf::run_capture(
                     device,
                     pref,
@@ -328,6 +404,11 @@ impl Session {
                             sh_frame.request_repaint();
                         }
                         sh_frame.feed_frame_gen(&frame);
+                        if let Some(tx) = stream_frames.lock().as_ref() {
+                            if let Err(TrySendError::Full(_)) = tx.try_send(frame.clone()) {
+                                sh_frame.stream.dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         if let Some(tx) = frame_tx.lock().as_ref() {
                             if let Err(TrySendError::Full(_)) = tx.try_send(frame) {
                                 sh_frame.status.dropped_frames.fetch_add(1, Ordering::Relaxed);
@@ -525,7 +606,9 @@ impl Session {
             Command::Screenshot => self.screenshot(),
             Command::OpenOutputFolder => Self::open_folder(&self.cfg.output_dir),
             Command::OpenScreenshotFolder => Self::open_folder(&self.cfg.screenshot_dir),
-            Command::Apply(_) | Command::Shutdown => unreachable!("handled by control loop"),
+            Command::Apply(_) | Command::SetConfig(_) | Command::ToggleStream | Command::Shutdown => {
+                unreachable!("handled by control loop")
+            }
         }
     }
 

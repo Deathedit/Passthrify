@@ -23,6 +23,7 @@ settings in `%APPDATA%\Passthrify`; delete that folder too for a clean slate.
 |---|---|
 | Save the last N seconds (instant replay) | `Alt+F10` |
 | Start / stop recording | `Alt+F9` |
+| Go live / end the stream | `Alt+F8` |
 | Screenshot (full-res PNG) | `Alt+F1` |
 | Fullscreen | `F11` or double-click the preview, `Esc` to leave |
 | Show / hide the sidebar | `Ctrl+B` (while Passthrify has focus) |
@@ -50,6 +51,26 @@ settings sections and are stored in `%APPDATA%\Passthrify\config\config.toml`. T
 same folder. The tray icon offers the same actions plus show/hide.
 
 Close **Elgato 4K Capture Utility** / OBS first: the card can only be opened by one app.
+
+### Streaming
+
+**Go live** (under Save replay, `Alt+F8` or the tray) streams the game to Twitch, YouTube or any
+RTMP(S) server. Set it up in Settings › **Streaming**: pick the service, paste your stream key
+(**Find your key** opens the right dashboard page) and choose the resolution, frame rate and
+bitrate. The defaults, 1080p60 at 6000 kbps, suit Twitch; YouTube takes more (about 12000 at
+1080p60).
+
+- The key is kept in Windows Credential Manager (`Passthrify/StreamKey/<service>`), never in
+  config.toml. Each service has its own.
+- The stream is its own H.264 NVENC encode, scaled down on the GPU (keeping the aspect ratio, so
+  21:9 stays 21:9) with a 2 s keyframe interval. Recordings and replays keep their own quality.
+  Audio is the capture card's.
+- If the connection drops, it reconnects by itself (2 s, then up to 30 s between tries). The
+  status bar shows `LIVE 00:12:03 · 6.1 Mbps`, or reconnecting, with dropped frames on hover.
+- Changing settings while live doesn't end the stream.
+- Test without going live: `passthrify --selftest 20 --stream rtmp://127.0.0.1:1935/live/test`
+  with a local server such as
+  `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/test -c copy test.flv`.
 
 ### Frame generation (experimental)
 
@@ -181,7 +202,7 @@ dev builds are kept.
   surfaces `#08090C`–`#1A1E25`), egui visuals, line icons and styled widgets.
 - **Fonts:** Inter (UI) and JetBrains Mono (numbers, timers) in `assets/fonts/`, embedded in
   the binary. Both are SIL OFL 1.1; the licenses ship next to the exe.
-- `PASSTHRIFY_SETTINGS=capture|audio|replay|hotkeys|display` opens Settings on launch.
+- `PASSTHRIFY_SETTINGS=capture|audio|replay|streaming|hotkeys|display` opens Settings on launch.
 
 ## Not yet supported
 

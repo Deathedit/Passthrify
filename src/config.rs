@@ -37,6 +37,55 @@ impl Codec {
     }
 }
 
+/// Where the live stream goes.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamService {
+    Twitch,
+    YouTube,
+    /// Any RTMP(S) server (`stream_server`).
+    Custom,
+}
+
+impl StreamService {
+    pub fn label(self) -> &'static str {
+        match self {
+            StreamService::Twitch => "Twitch",
+            StreamService::YouTube => "YouTube",
+            StreamService::Custom => "Custom RTMP",
+        }
+    }
+
+    /// Ingest URL without the key (Custom: the configured server).
+    pub fn server(self, custom: &str) -> String {
+        match self {
+            // Twitch picks the nearest ingest itself for this address.
+            StreamService::Twitch => "rtmp://live.twitch.tv/app".into(),
+            StreamService::YouTube => "rtmps://a.rtmps.youtube.com:443/live2".into(),
+            StreamService::Custom => custom.trim().trim_end_matches('/').into(),
+        }
+    }
+
+    /// Full publish URL: server + "/" + key.
+    pub fn url(self, custom: &str, key: &str) -> String {
+        let server = self.server(custom);
+        let key = key.trim();
+        if key.is_empty() {
+            server
+        } else {
+            format!("{server}/{key}")
+        }
+    }
+
+    /// Where the user finds their stream key.
+    pub fn key_page(self) -> Option<&'static str> {
+        match self {
+            StreamService::Twitch => Some("https://dashboard.twitch.tv/settings/stream"),
+            StreamService::YouTube => Some("https://studio.youtube.com/"),
+            StreamService::Custom => None,
+        }
+    }
+}
+
 /// Chroma subsampling kept through capture, preview and encoding.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Chroma {
@@ -138,6 +187,7 @@ pub struct Config {
     pub hotkey_save_replay: String,
     pub hotkey_toggle_record: String,
     pub hotkey_screenshot: String,
+    pub hotkey_toggle_stream: String,
 
     pub windows_notifications: bool,
     pub present_mode: PresentMode,
@@ -163,6 +213,14 @@ pub struct Config {
     /// Upload each captured frame to CUDA once and encode from there (NVENC and frame
     /// generation share it). Off = the encoder takes system-memory frames as before.
     pub gpu_frames: bool,
+
+    /// Live streaming: service, Custom server URL, output height (0 = source), max frame rate
+    /// and video bitrate. The stream key lives in Windows Credential Manager, not here.
+    pub stream_service: StreamService,
+    pub stream_server: String,
+    pub stream_height: u32,
+    pub stream_fps: u32,
+    pub stream_bitrate_kbps: u32,
 }
 
 impl Default for Config {
@@ -197,6 +255,7 @@ impl Default for Config {
             hotkey_save_replay: "Alt+F10".into(),
             hotkey_toggle_record: "Alt+F9".into(),
             hotkey_screenshot: "Alt+F1".into(),
+            hotkey_toggle_stream: "Alt+F8".into(),
             windows_notifications: true,
             present_mode: PresentMode::Mailbox,
             update_channel: crate::updater::UpdateChannel::Stable,
@@ -208,6 +267,11 @@ impl Default for Config {
             frame_gen_multiplier: 2,
             frame_gen_dir: None,
             gpu_frames: true,
+            stream_service: StreamService::Twitch,
+            stream_server: String::new(),
+            stream_height: 1080,
+            stream_fps: 60,
+            stream_bitrate_kbps: 6000,
         }
     }
 }

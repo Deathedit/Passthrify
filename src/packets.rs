@@ -54,6 +54,8 @@ pub struct PacketBus {
     pub replay: Mutex<ReplayBuffer>,
     replay_enabled: AtomicBool,
     recorder: Mutex<Option<Sender<Arc<EncodedPacket>>>>,
+    /// The live stream takes the audio packets (it encodes its own video).
+    streamer: Mutex<Option<Sender<Arc<EncodedPacket>>>>,
 }
 
 impl PacketBus {
@@ -62,6 +64,7 @@ impl PacketBus {
             replay: Mutex::new(ReplayBuffer::new(replay_seconds as i64 * 1_000_000)),
             replay_enabled: AtomicBool::new(replay_enabled),
             recorder: Mutex::new(None),
+            streamer: Mutex::new(None),
         }
     }
 
@@ -70,9 +73,18 @@ impl PacketBus {
         if self.replay_enabled.load(Ordering::Relaxed) {
             self.replay.lock().push(pkt.clone());
         }
+        if pkt.kind == StreamKind::Audio {
+            if let Some(tx) = self.streamer.lock().as_ref() {
+                let _ = tx.try_send(pkt.clone());
+            }
+        }
         if let Some(tx) = self.recorder.lock().as_ref() {
             let _ = tx.send(pkt);
         }
+    }
+
+    pub fn set_streamer(&self, tx: Option<Sender<Arc<EncodedPacket>>>) {
+        *self.streamer.lock() = tx;
     }
 
     pub fn set_recorder(&self, tx: Option<Sender<Arc<EncodedPacket>>>) {

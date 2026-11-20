@@ -12,7 +12,7 @@ use super::pickers;
 use super::theme::{self, icons, Kind};
 use crate::capture::video_mf::VideoMode;
 use crate::color::{ColorInfo, RangePref};
-use crate::config::{Chroma, Codec, Config, PresentMode};
+use crate::config::{Chroma, Codec, Config, PresentMode, StreamService};
 use crate::updater::{self, UpdateChannel, UpdateState, Updater};
 
 pub enum SettingsOutcome {
@@ -27,19 +27,28 @@ pub enum Section {
     Capture,
     Audio,
     Replay,
+    Streaming,
     Hotkeys,
     Display,
     Updates,
 }
 
 impl Section {
-    pub const ALL: [Section; 6] =
-        [Section::Capture, Section::Audio, Section::Replay, Section::Hotkeys, Section::Display, Section::Updates];
+    pub const ALL: [Section; 7] = [
+        Section::Capture,
+        Section::Audio,
+        Section::Replay,
+        Section::Streaming,
+        Section::Hotkeys,
+        Section::Display,
+        Section::Updates,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Section::Capture => "Capture",
             Section::Audio => "Audio",
             Section::Replay => "Replay and recording",
+            Section::Streaming => "Streaming",
             Section::Hotkeys => "Hotkeys",
             Section::Display => "Display",
             Section::Updates => "Updates",
@@ -50,6 +59,7 @@ impl Section {
             Section::Capture => icons::CAPTURE,
             Section::Audio => icons::AUDIO,
             Section::Replay => icons::HISTORY,
+            Section::Streaming => icons::LIVE,
             Section::Hotkeys => icons::KEYBOARD,
             Section::Display => icons::DISPLAY,
             Section::Updates => icons::DOWNLOAD,
@@ -62,6 +72,11 @@ impl Section {
             Section::Audio => if cfg.passthrough_enabled { "Passthrough on" } else { "Passthrough off" }.into(),
             Section::Replay if cfg.replay_enabled => format!("{} s · {}", cfg.replay_seconds, cfg.codec.short_label()),
             Section::Replay => "Replay off".into(),
+            Section::Streaming => {
+                let res = if cfg.stream_height == 0 { "Source".to_string() } else { format!("{}p", cfg.stream_height) };
+                let name = if cfg.stream_service == StreamService::Custom { "Custom" } else { cfg.stream_service.label() };
+                format!("{name} · {res}{}", cfg.stream_fps)
+            }
             Section::Hotkeys => pretty_hotkey(&cfg.hotkey_save_replay),
             Section::Display => {
                 let present = match cfg.present_mode {
@@ -85,6 +100,7 @@ enum HotkeyField {
     SaveReplay,
     Record,
     Screenshot,
+    Stream,
 }
 
 pub struct SettingsUi {
@@ -98,6 +114,11 @@ pub struct SettingsUi {
     capture: Option<HotkeyField>,
     /// Why self-update cannot install here (dev build, read-only folder), if so.
     install_blocker: Option<String>,
+    /// The stream key being edited, for `stream_key_service` (saved to Credential Manager on
+    /// Apply, never put in the config).
+    stream_key: String,
+    stream_key_saved: String,
+    stream_key_service: StreamService,
 }
 
 /// The section's fields, without a card around them (the sidebar is the frame).
@@ -118,6 +139,9 @@ impl SettingsUi {
             audio_outputs,
             capture: None,
             install_blocker: updater::install_blocker(),
+            stream_key: crate::secrets::stream_key(cfg.stream_service).unwrap_or_default(),
+            stream_key_saved: crate::secrets::stream_key(cfg.stream_service).unwrap_or_default(),
+            stream_key_service: cfg.stream_service,
         }
     }
 
@@ -167,6 +191,7 @@ impl SettingsUi {
                     return SettingsOutcome::OpenFolder { screenshots };
                 }
             }
+            Section::Streaming => self.streaming_card(ui),
             Section::Hotkeys => self.hotkeys_card(ui, hotkey_errors),
             Section::Display => self.display_card(ui, frame_gen),
             Section::Updates => self.updates_card(ui, updater, recording),
@@ -183,6 +208,7 @@ impl SettingsUi {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::button(ui, Kind::Primary, None, "Apply", None).clicked() {
+                    self.save_stream_key();
                     outcome = SettingsOutcome::Apply(Box::new(self.draft.clone()));
                 }
                 if theme::button(ui, Kind::Ghost, None, "Cancel", None).clicked() {
@@ -219,7 +245,13 @@ impl SettingsUi {
                 d.hotkey_save_replay = def.hotkey_save_replay;
                 d.hotkey_toggle_record = def.hotkey_toggle_record;
                 d.hotkey_screenshot = def.hotkey_screenshot;
+                d.hotkey_toggle_stream = def.hotkey_toggle_stream;
                 self.capture = None;
+            }
+            Section::Streaming => {
+                d.stream_height = def.stream_height;
+                d.stream_fps = def.stream_fps;
+                d.stream_bitrate_kbps = def.stream_bitrate_kbps;
             }
             Section::Display => {
                 d.windows_notifications = def.windows_notifications;
@@ -402,6 +434,79 @@ impl SettingsUi {
         open_folder
     }
 
+    /// Saves the edited stream key if it changed.
+    fn save_stream_key(&mut self) {
+        if self.stream_key.trim() == self.stream_key_saved.trim() {
+            return;
+        }
+        match crate::secrets::set_stream_key(self.stream_key_service, &self.stream_key) {
+            Ok(()) => self.stream_key_saved = self.stream_key.clone(),
+            Err(e) => tracing::error!("saving the stream key: {e:#}"),
+        }
+    }
+
+    fn streaming_card(&mut self, ui: &mut egui::Ui) {
+        // Each service has its own key: switching service shows (and edits) that one.
+        if self.stream_key_service != self.draft.stream_service {
+            self.save_stream_key();
+            self.stream_key_service = self.draft.stream_service;
+            self.stream_key = crate::secrets::stream_key(self.stream_key_service).unwrap_or_default();
+            self.stream_key_saved = self.stream_key.clone();
+        }
+        let d = &mut self.draft;
+        let key = &mut self.stream_key;
+        section_body(ui, |ui| {
+            let w = ui.available_width();
+            theme::field_label(ui, "Service");
+            theme::segmented(
+                ui,
+                &mut d.stream_service,
+                &[(StreamService::Twitch, "Twitch", true), (StreamService::YouTube, "YouTube", true), (StreamService::Custom, "Custom", true)],
+            );
+            ui.add_space(8.0);
+            if d.stream_service == StreamService::Custom {
+                theme::field_label(ui, "Server");
+                ui.add(egui::TextEdit::singleline(&mut d.stream_server).hint_text("rtmp://host/app").desired_width(w));
+                ui.add_space(8.0);
+            }
+            ui.horizontal(|ui| {
+                theme::field_label(ui, "Stream key");
+                if let Some(url) = d.stream_service.key_page() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let link = ui.add(
+                            egui::Label::new(RichText::new("Find your key").font(FontId::new(12.0, theme::medium())).color(theme::SIGNAL))
+                                .sense(egui::Sense::click()),
+                        );
+                        if link.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+                        }
+                    });
+                }
+            });
+            let hint = if d.stream_service == StreamService::Custom { "Optional" } else { "Paste your stream key" };
+            ui.add(egui::TextEdit::singleline(key).password(true).hint_text(hint).desired_width(w));
+            ui.label(RichText::new("Kept in Windows Credential Manager, not in the settings file.").size(12.0).color(theme::TEXT3));
+            ui.add_space(10.0);
+
+            theme::field_label(ui, "Resolution");
+            theme::segmented(ui, &mut d.stream_height, &[(720, "720p", true), (1080, "1080p", true), (1440, "1440p", true), (0, "Source", true)]);
+            ui.add_space(6.0);
+            theme::field_label(ui, "Frame rate");
+            theme::segmented(ui, &mut d.stream_fps, &[(30, "30 fps", true), (60, "60 fps", true)]);
+            ui.add_space(6.0);
+            theme::field_label(ui, "Video bitrate");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut d.stream_bitrate_kbps).range(1000..=50_000).speed(50.0).suffix(" kbps"));
+                let tip = match d.stream_service {
+                    StreamService::Twitch => "Twitch: up to about 8000",
+                    StreamService::YouTube => "YouTube 1080p60: about 12000",
+                    StreamService::Custom => "",
+                };
+                ui.label(RichText::new(tip).font(theme::mono(11.0)).color(theme::TEXT3));
+            });
+        });
+    }
+
     fn hotkeys_card(&mut self, ui: &mut egui::Ui, hotkey_errors: &[String]) {
         let capture = self.capture;
         let mut start: Option<Option<HotkeyField>> = None;
@@ -413,6 +518,7 @@ impl SettingsUi {
                 (HotkeyField::SaveReplay, "Save replay", &mut d.hotkey_save_replay),
                 (HotkeyField::Record, "Start / stop recording", &mut d.hotkey_toggle_record),
                 (HotkeyField::Screenshot, "Screenshot", &mut d.hotkey_screenshot),
+                (HotkeyField::Stream, "Start / stop streaming", &mut d.hotkey_toggle_stream),
             ];
             for (i, (field, label, value)) in rows.into_iter().enumerate() {
                 if i > 0 {
@@ -695,6 +801,7 @@ impl SettingsUi {
             HotkeyField::SaveReplay => &mut self.draft.hotkey_save_replay,
             HotkeyField::Record => &mut self.draft.hotkey_toggle_record,
             HotkeyField::Screenshot => &mut self.draft.hotkey_screenshot,
+            HotkeyField::Stream => &mut self.draft.hotkey_toggle_stream,
         };
         *target = combo;
         self.capture = None;

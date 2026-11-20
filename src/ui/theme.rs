@@ -192,6 +192,8 @@ pub mod icons {
     icon!(AUDIO, r#"<path d="M4 15v-3a8 8 0 0 1 16 0v3M4 15a2 2 0 0 1 2-2h1v6H6a2 2 0 0 1-2-2zM20 15a2 2 0 0 0-2-2h-1v6h1a2 2 0 0 0 2-2z"/>"#);
     icon!(HISTORY, r#"<path d="M4 12a8 8 0 1 0 2.34-5.66M4 4v4h4M12 9v3l2 1.5"/>"#);
     icon!(KEYBOARD, r#"<path d="M3.5 7.5A1.5 1.5 0 0 1 5 6h14a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 19 18H5a1.5 1.5 0 0 1-1.5-1.5zM7 10h.01M10 10h.01M13 10h.01M17 10h.01M8 14h8"/>"#);
+    // Live stream: a dot with broadcast arcs.
+    icon!(LIVE, r#"<circle cx="12" cy="12" r="2" fill="white" stroke="none"/><path d="M8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7M5.6 18.4a9 9 0 0 1 0-12.8M18.4 5.6a9 9 0 0 1 0 12.8"/>"#);
     icon!(DISPLAY, r#"<path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h15A1.5 1.5 0 0 1 21 6.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 15.5zM8 20h8M12 17v3"/>"#);
 }
 

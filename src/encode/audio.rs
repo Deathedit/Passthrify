@@ -13,17 +13,31 @@ use crate::packets::{EncodedPacket, SendParams, StreamKind, StreamParams};
 
 const MAX_DRIFT_SAMPLES: i64 = AUDIO_RATE as i64 / 10;
 
-pub fn run(rx: Receiver<AudioChunk>, params: Arc<StreamParams>, mut sink: impl FnMut(EncodedPacket)) -> Result<()> {
+const SAMPLE_FORMAT: ff::format::Sample = ff::format::Sample::F32(ff::format::sample::Type::Planar);
+
+/// The AAC encoder every audio stream uses (48 kHz stereo, 192 kbps, global header).
+fn open_encoder() -> Result<ff::encoder::Audio> {
     let codec = ff::encoder::find(ff::codec::Id::AAC).ok_or_else(|| anyhow!("no AAC encoder"))?;
     let mut enc = ff::codec::context::Context::new_with_codec(codec).encoder().audio()?;
-    let fmt = ff::format::Sample::F32(ff::format::sample::Type::Planar);
     enc.set_rate(AUDIO_RATE as i32);
     enc.set_channel_layout(ff::ChannelLayout::STEREO);
-    enc.set_format(fmt);
+    enc.set_format(SAMPLE_FORMAT);
     enc.set_bit_rate(192_000);
     enc.set_time_base(ff::Rational(1, AUDIO_RATE as i32));
     enc.set_flags(ff::codec::Flags::GLOBAL_HEADER);
-    let mut enc = enc.open_with(ff::Dictionary::new()).context("opening AAC encoder")?;
+    enc.open_with(ff::Dictionary::new()).context("opening AAC encoder")
+}
+
+/// Codec parameters of the AAC stream `run` produces, for muxers that start later (the live
+/// stream): the same encoder settings always give the same parameters.
+pub fn params() -> Result<SendParams> {
+    let enc = open_encoder()?;
+    Ok(SendParams(super::params_of(&enc)))
+}
+
+pub fn run(rx: Receiver<AudioChunk>, params: Arc<StreamParams>, mut sink: impl FnMut(EncodedPacket)) -> Result<()> {
+    let mut enc = open_encoder()?;
+    let fmt = SAMPLE_FORMAT;
     *params.audio.lock() = Some(SendParams(super::params_of(&enc)));
 
     let frame_size = enc.frame_size().max(1024) as usize;
