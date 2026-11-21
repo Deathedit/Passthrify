@@ -633,7 +633,7 @@ impl Drop for GpuFrame {
 /// `passthrify --gpu-test`: encodes synthetic frames from system memory and from CUDA frames,
 /// prints where each path spends time, and checks that frame generation gives the same picture
 /// from a CUDA frame as from a CPU frame. Needs an NVIDIA GPU, no capture card.
-pub fn self_test(vfg_dir: Option<&std::path::Path>) -> Result<()> {
+pub fn self_test(vfg_dir: Option<&std::path::Path>, range_only: bool) -> Result<()> {
     use crate::capture::FramePool;
     use crate::capture::video_mf::{PixFmt, VideoMode};
     use crate::config::Codec;
@@ -662,6 +662,7 @@ pub fn self_test(vfg_dir: Option<&std::path::Path>) -> Result<()> {
     };
 
     println!("CUDA: {}", match driver() { Ok(_) => "ok".to_string(), Err(e) => format!("{e:#}") });
+    if !range_only {
     // Raw upload speed, nothing else running: pinned (capture buffers) vs pageable memory.
     {
         let (w, h) = (3840, 2160);
@@ -753,6 +754,56 @@ pub fn self_test(vfg_dir: Option<&std::path::Path>) -> Result<()> {
                 Err(e) => println!("{label}: encoder failed: {e:#}"),
             }
         }
+    }
+
+    }
+
+    // Full-range input (what the 4K X sends) must come out as limited range, on both paths.
+    // Writes MP4s to the temp dir for checking with ffprobe (signalstats).
+    let full = crate::color::ColorInfo { full_range: true, matrix: crate::color::Matrix::Bt601 };
+    for use_gpu in [true, false] {
+        let (w, h) = (1920, 1080);
+        let mode = VideoMode { index: 0, width: w, height: h, fps_num: 60, fps_den: 1, format: PixFmt::Nv12 };
+        let cuda = if use_gpu { Some(CudaFrames::new(w, h, Chroma::S420)?) } else { None };
+        let cfg = crate::encode::video::VideoEncoderConfig {
+            codec: Codec::Hevc,
+            mode,
+            chroma: Chroma::S420,
+            color: full,
+            bitrate: 20_000_000,
+            gpu: cuda.clone(),
+        };
+        let params: Arc<crate::packets::StreamParams> = Arc::default();
+        let (tx, rx) = crossbeam_channel::bounded::<Arc<VideoFrame>>(4);
+        let packets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let enc = {
+            let (packets, params) = (packets.clone(), params.clone());
+            std::thread::spawn(move || {
+                crate::encode::video::run(cfg, rx, Arc::new(AtomicBool::new(false)), params, |p| packets.lock().push(p))
+            })
+        };
+        let mut scratch = Vec::new();
+        for k in 0..60 {
+            let mut f = make(w, h, Chroma::S420, k);
+            f.color = full;
+            if let Some(c) = &cuda {
+                let _ = f.gpu.set(c.upload(&f, &mut scratch)?);
+            }
+            tx.send(Arc::new(f)).ok();
+        }
+        drop(tx);
+        enc.join().map_err(|_| anyhow!("encoder thread panicked"))??;
+        let path = std::env::temp_dir().join(format!("passthrify-range-{}.mp4", if use_gpu { "cuda" } else { "cpu" }));
+        let video = params.video.lock().clone().ok_or_else(|| anyhow!("no video params"))?;
+        let mut writer = crate::mux::LiveWriter::create(&path, &video, None)?;
+        for p in packets.lock().iter() {
+            writer.write(p)?;
+        }
+        writer.finish()?;
+        println!("range check ({}): {}", if use_gpu { "CUDA" } else { "CPU" }, path.display());
+    }
+    if range_only {
+        return Ok(());
     }
 
     // Frame generation from a CUDA frame must match the same frame from CPU memory.

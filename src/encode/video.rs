@@ -53,7 +53,9 @@ pub fn preset_for(m: &VideoMode) -> &'static str {
     }
 }
 
-pub fn open(cfg: &VideoEncoderConfig, gpu: Option<&CudaFrames>) -> Result<ff::encoder::Video> {
+/// `frames`: encode CUDA frames from this frames context (None = system memory);
+/// `full_range`: what the frames sent to the encoder are (tagged in the stream).
+pub fn open(cfg: &VideoEncoderConfig, frames: Option<*mut ff::ffi::AVBufferRef>, full_range: bool) -> Result<ff::encoder::Video> {
     if !cfg.codec.supports(cfg.chroma) {
         anyhow::bail!("{} can't encode {} on NVENC; pick HEVC or H.264", cfg.codec.short_label(), cfg.chroma.label());
     }
@@ -63,11 +65,11 @@ pub fn open(cfg: &VideoEncoderConfig, gpu: Option<&CudaFrames>) -> Result<ff::en
     let m = &cfg.mode;
     enc.set_width(m.width);
     enc.set_height(m.height);
-    match gpu {
+    match frames {
         // CUDA frames: NVENC reads them in place (registered device memory), no upload.
-        Some(g) => unsafe {
+        Some(f) => unsafe {
             enc.set_format(ff::format::Pixel::CUDA);
-            (*enc.as_mut_ptr()).hw_frames_ctx = ff::ffi::av_buffer_ref(g.frames_ctx());
+            (*enc.as_mut_ptr()).hw_frames_ctx = ff::ffi::av_buffer_ref(f);
         },
         None => enc.set_format(pixel_format(cfg.chroma)),
     }
@@ -81,7 +83,7 @@ pub fn open(cfg: &VideoEncoderConfig, gpu: Option<&CudaFrames>) -> Result<ff::en
     enc.set_flags(ff::codec::Flags::GLOBAL_HEADER);
     unsafe {
         let ctx = enc.as_mut_ptr();
-        (*ctx).color_range = if cfg.color.full_range {
+        (*ctx).color_range = if full_range {
             ff::ffi::AVColorRange::AVCOL_RANGE_JPEG
         } else {
             ff::ffi::AVColorRange::AVCOL_RANGE_MPEG
@@ -122,30 +124,47 @@ pub fn run(
     params: Arc<StreamParams>,
     mut sink: impl FnMut(EncodedPacket),
 ) -> Result<()> {
+    // Files are written in limited range (16-235): many players ignore the full-range flag and
+    // crush the shadows, so full-range input (the 4K X's NV12) is converted. On the GPU by
+    // colorspace_cuda (NV12 / YUV444P; not NV16), on the CPU while copying.
+    let (w, h) = (cfg.mode.width, cfg.mode.height);
+    let mut range_filter: Option<crate::cuda_filter::CudaFilter> = None;
+    if let (Some(g), true) = (cfg.gpu.as_deref(), cfg.color.full_range && cfg.chroma != Chroma::S422) {
+        match crate::cuda_filter::CudaFilter::new(g.frames_ctx(), w, h, cfg.color, &[crate::cuda_filter::to_limited_range()]) {
+            Ok(f) => range_filter = Some(f),
+            Err(e) => tracing::warn!("can't convert to limited range on the GPU, keeping full range: {e:#}"),
+        }
+    }
     // The CUDA path falls back to system-memory frames if NVENC won't open with it.
-    let (mut enc, gpu) = match cfg.gpu.as_deref() {
-        Some(g) => match open(&cfg, Some(g)) {
-            Ok(enc) => (enc, cfg.gpu.clone()),
-            Err(e) => {
-                tracing::warn!("NVENC with CUDA frames failed, using system memory: {e:#}");
-                (open(&cfg, None)?, None)
+    let (mut enc, gpu, full_out) = match cfg.gpu.as_deref() {
+        Some(g) => {
+            let frames = range_filter.as_ref().map_or(g.frames_ctx(), |f| f.out_frames);
+            let full = cfg.color.full_range && range_filter.is_none();
+            match open(&cfg, Some(frames), full) {
+                Ok(enc) => (enc, cfg.gpu.clone(), full),
+                Err(e) => {
+                    tracing::warn!("NVENC with CUDA frames failed, using system memory: {e:#}");
+                    range_filter = None;
+                    (open(&cfg, None, false)?, None, false)
+                }
             }
-        },
-        None => (open(&cfg, None)?, None),
+        }
+        None => (open(&cfg, None, false)?, None, false),
     };
+    // The CPU path converts full range itself.
+    let cpu_lut = (gpu.is_none() && cfg.color.full_range).then(LimitedRange::new);
     *params.video.lock() = Some(SendParams(super::params_of(&enc)));
     tracing::info!(
         "video encoder {} {} {} {} @ {:.1} Mbps (preset {}, {} frames)",
         cfg.codec.nvenc_name(),
         cfg.mode,
         cfg.chroma.label(),
-        cfg.color.label(),
+        if full_out { cfg.color.label() } else { cfg.color.with_range(crate::color::RangePref::Limited).label() },
         cfg.bitrate as f64 / 1e6,
         preset_for(&cfg.mode),
         if gpu.is_some() { "CUDA" } else { "system memory" }
     );
 
-    let (w, h) = (cfg.mode.width, cfg.mode.height);
     let mut frame = ff::frame::Video::new(pixel_format(cfg.chroma), w, h);
     let mut last_pts = i64::MIN;
     let mut pkt = ff::Packet::empty();
@@ -179,6 +198,9 @@ pub fn run(
                         &uploaded
                     }
                 };
+                if let Some(filter) = range_filter.as_mut() {
+                    return filter.run(src.as_ptr(), pts).map(|f| f.unwrap_or_else(ff::frame::Video::empty));
+                }
                 let f = unsafe { ff::ffi::av_frame_clone(src.as_ptr()) };
                 if f.is_null() {
                     anyhow::bail!("av_frame_clone failed");
@@ -186,6 +208,9 @@ pub fn run(
                 Ok(unsafe { ff::frame::Video::wrap(f) })
             });
             let mut f = prepared?;
+            if unsafe { (*f.as_ptr()).buf[0].is_null() } {
+                continue; // the filter wants more input first
+            }
             f.set_pts(Some(pts));
             f.set_kind(kind);
             crate::perf::ENCODE_SEND.time(|| -> Result<()> {
@@ -201,11 +226,15 @@ pub fn run(
             ff::ffi::av_frame_make_writable(frame.as_mut_ptr());
         }
         let (cw, ch) = vf.chroma_size();
-        copy_plane(vf.y_plane(), w as usize, h as usize, frame.stride(0), frame.data_mut(0));
+        let (luma, chroma) = match &cpu_lut {
+            Some(l) => (Some(&l.luma), Some(&l.chroma)),
+            None => (None, None),
+        };
+        copy_plane(vf.y_plane(), w as usize, h as usize, frame.stride(0), frame.data_mut(0), luma);
         match cfg.chroma {
             // NV12 / NV16: interleaved UV plane, `cw * 2` bytes per row.
             Chroma::S420 | Chroma::S422 => {
-                copy_plane(vf.uv_plane(), cw as usize * 2, ch as usize, frame.stride(1), frame.data_mut(1))
+                copy_plane(vf.uv_plane(), cw as usize * 2, ch as usize, frame.stride(1), frame.data_mut(1), chroma)
             }
             // NV24 -> planar U and V.
             Chroma::S444 => {
@@ -216,11 +245,11 @@ pub fn run(
                     let src = &uv[r * row..(r + 1) * row];
                     let u = &mut frame.data_mut(1)[r * us..r * us + cw as usize];
                     for (d, s) in u.iter_mut().zip(src.chunks_exact(2)) {
-                        *d = s[0];
+                        *d = chroma.map_or(s[0], |t| t[s[0] as usize]);
                     }
                     let v = &mut frame.data_mut(2)[r * vs..r * vs + cw as usize];
                     for (d, s) in v.iter_mut().zip(src.chunks_exact(2)) {
-                        *d = s[1];
+                        *d = chroma.map_or(s[1], |t| t[s[1] as usize]);
                     }
                 }
             }
@@ -242,9 +271,31 @@ pub fn run(
     Ok(())
 }
 
-fn copy_plane(src: &[u8], row_bytes: usize, rows: usize, dst_stride: usize, dst: &mut [u8]) {
+/// Copies rows, through `lut` if given.
+fn copy_plane(src: &[u8], row_bytes: usize, rows: usize, dst_stride: usize, dst: &mut [u8], lut: Option<&[u8; 256]>) {
     for r in 0..rows {
-        dst[r * dst_stride..r * dst_stride + row_bytes].copy_from_slice(&src[r * row_bytes..(r + 1) * row_bytes]);
+        let (d, s) = (&mut dst[r * dst_stride..r * dst_stride + row_bytes], &src[r * row_bytes..(r + 1) * row_bytes]);
+        match lut {
+            Some(t) => d.iter_mut().zip(s).for_each(|(d, &s)| *d = t[s as usize]),
+            None => d.copy_from_slice(s),
+        }
+    }
+}
+
+/// Full range (0-255) to limited range (Y 16-235, Cb/Cr 16-240) lookup tables.
+struct LimitedRange {
+    luma: [u8; 256],
+    chroma: [u8; 256],
+}
+
+impl LimitedRange {
+    fn new() -> Self {
+        let mut t = Self { luma: [0; 256], chroma: [0; 256] };
+        for v in 0..256 {
+            t.luma[v] = (16.0 + v as f64 * 219.0 / 255.0).round() as u8;
+            t.chroma[v] = (128.0 + (v as f64 - 128.0) * 224.0 / 255.0).round().clamp(16.0, 240.0) as u8;
+        }
+        t
     }
 }
 
@@ -280,5 +331,18 @@ mod tests {
         assert_eq!(preset_for(&mode(3840, 2160, 144)), "p2");
         assert_eq!(preset_for(&mode(1920, 1080, 240)), "p5");
         assert_eq!(preset_for(&mode(3440, 1440, 144)), "p3");
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::LimitedRange;
+
+    #[test]
+    fn full_range_maps_into_limited() {
+        let t = LimitedRange::new();
+        assert_eq!((t.luma[0], t.luma[255]), (16, 235));
+        assert_eq!((t.chroma[0], t.chroma[128], t.chroma[255]), (16, 128, 240));
+        assert!(t.luma.windows(2).all(|w| w[0] <= w[1]), "monotonic");
     }
 }

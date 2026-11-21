@@ -18,6 +18,7 @@ use ff::ffi;
 use parking_lot::Mutex;
 
 use crate::capture::{Chroma, VideoFrame};
+use crate::cuda_filter::CudaFilter;
 use crate::color::Matrix;
 use crate::packets::{EncodedPacket, SendParams, StreamKind};
 
@@ -286,7 +287,7 @@ struct VideoPath {
 }
 
 enum Scaler {
-    Gpu(GpuScaler),
+    Gpu(CudaFilter),
     Cpu(CpuScaler),
 }
 
@@ -295,9 +296,15 @@ impl VideoPath {
         let (width, height) = output_size(f.width, f.height, t.height);
         let scaler = if key.gpu {
             let g = f.gpu.get().ok_or_else(|| anyhow!("no CUDA frame"))?;
-            Scaler::Gpu(GpuScaler::new(g.as_ptr(), f.width, f.height, width, height)?)
+            // Scale on the GPU, and bring full range down to limited (see `to_limited_range`).
+            let mut chain = vec![("scale_cuda", format!("w={width}:h={height}:format=nv12"))];
+            if f.color.full_range {
+                chain.push(crate::cuda_filter::to_limited_range());
+            }
+            let frames = unsafe { (*g.as_ptr()).hw_frames_ctx };
+            Scaler::Gpu(CudaFilter::new(frames, f.width, f.height, f.color, &chain)?)
         } else {
-            Scaler::Cpu(CpuScaler::new(f.width, f.height, f.chroma, width, height)?)
+            Scaler::Cpu(CpuScaler::new(f.width, f.height, f.chroma, f.color, width, height)?)
         };
         let enc = open_encoder(f, width, height, t, &scaler)?;
         let params = SendParams(crate::encode::params_of(&enc));
@@ -310,7 +317,7 @@ impl VideoPath {
         let mut frame = match &mut self.scaler {
             Scaler::Gpu(s) => {
                 let Some(g) = f.gpu.get() else { return Ok(Vec::new()) };
-                match s.scale(g.as_ptr(), pts)? {
+                match s.run(g.as_ptr(), pts)? {
                     Some(fr) => fr,
                     None => return Ok(Vec::new()),
                 }
@@ -357,8 +364,8 @@ fn open_encoder(f: &VideoFrame, width: u32, height: u32, t: &StreamTarget, scale
     unsafe {
         let ctx = enc.as_mut_ptr();
         (*ctx).rc_buffer_size = bitrate as i32;
-        (*ctx).color_range =
-            if f.color.full_range { ffi::AVColorRange::AVCOL_RANGE_JPEG } else { ffi::AVColorRange::AVCOL_RANGE_MPEG };
+        // Both scalers output limited range.
+        (*ctx).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
         (*ctx).colorspace = match f.color.matrix {
             Matrix::Bt709 => ffi::AVColorSpace::AVCOL_SPC_BT709,
             Matrix::Bt601 => ffi::AVColorSpace::AVCOL_SPC_SMPTE170M,
@@ -383,118 +390,11 @@ fn open_encoder(f: &VideoFrame, width: u32, height: u32, t: &StreamTarget, scale
     enc.open_with(opts).context("opening h264_nvenc for the stream")
 }
 
-/// `scale_cuda` in an FFmpeg filter graph: CUDA frames in, NV12 CUDA frames at the output size.
-struct GpuScaler {
-    graph: *mut ffi::AVFilterGraph,
-    src: *mut ffi::AVFilterContext,
-    sink: *mut ffi::AVFilterContext,
-    out_frames: *mut ffi::AVBufferRef,
-}
-
-unsafe impl Send for GpuScaler {}
-
 fn av_err(e: i32) -> String {
     ff::Error::from(e).to_string()
 }
 
-impl GpuScaler {
-    fn new(sample: *const ffi::AVFrame, src_w: u32, src_h: u32, w: u32, h: u32) -> Result<Self> {
-        unsafe {
-            let graph = ffi::avfilter_graph_alloc();
-            if graph.is_null() {
-                bail!("avfilter_graph_alloc failed");
-            }
-            let mut s = Self { graph, src: std::ptr::null_mut(), sink: std::ptr::null_mut(), out_frames: std::ptr::null_mut() };
-            let filter = |name: &str| {
-                let c = CString::new(name).unwrap();
-                let f = ffi::avfilter_get_by_name(c.as_ptr());
-                if f.is_null() {
-                    Err(anyhow!("FFmpeg has no {name} filter"))
-                } else {
-                    Ok(f)
-                }
-            };
-            s.src = ffi::avfilter_graph_alloc_filter(graph, filter("buffer")?, c"in".as_ptr());
-            if s.src.is_null() {
-                bail!("creating the buffer source failed");
-            }
-            let par = ffi::av_buffersrc_parameters_alloc();
-            (*par).format = ffi::AVPixelFormat::AV_PIX_FMT_CUDA as i32;
-            (*par).width = src_w as i32;
-            (*par).height = src_h as i32;
-            (*par).time_base = TB_US;
-            (*par).hw_frames_ctx = (*sample).hw_frames_ctx;
-            let e = ffi::av_buffersrc_parameters_set(s.src, par);
-            ffi::av_free(par.cast());
-            if e < 0 {
-                bail!("buffer source parameters: {}", av_err(e));
-            }
-            let e = ffi::avfilter_init_str(s.src, std::ptr::null());
-            if e < 0 {
-                bail!("buffer source init: {}", av_err(e));
-            }
-            let mut scale = std::ptr::null_mut();
-            let args = CString::new(format!("w={w}:h={h}:format=nv12")).unwrap();
-            let e = ffi::avfilter_graph_create_filter(&mut scale, filter("scale_cuda")?, c"scale".as_ptr(), args.as_ptr(), std::ptr::null_mut(), graph);
-            if e < 0 {
-                bail!("scale_cuda: {}", av_err(e));
-            }
-            let e = ffi::avfilter_graph_create_filter(&mut s.sink, filter("buffersink")?, c"out".as_ptr(), std::ptr::null(), std::ptr::null_mut(), graph);
-            if e < 0 {
-                bail!("buffer sink: {}", av_err(e));
-            }
-            for (a, b) in [(s.src, scale), (scale, s.sink)] {
-                let e = ffi::avfilter_link(a, 0, b, 0);
-                if e < 0 {
-                    bail!("linking filters: {}", av_err(e));
-                }
-            }
-            let e = ffi::avfilter_graph_config(graph, std::ptr::null_mut());
-            if e < 0 {
-                bail!("configuring the scale graph: {}", av_err(e));
-            }
-            s.out_frames = ffi::av_buffersink_get_hw_frames_ctx(s.sink);
-            if s.out_frames.is_null() {
-                bail!("scale_cuda produced no CUDA frames");
-            }
-            Ok(s)
-        }
-    }
-
-    /// Scales one CUDA frame; None if the graph wants more input first.
-    fn scale(&mut self, frame: *const ffi::AVFrame, pts: i64) -> Result<Option<ff::frame::Video>> {
-        unsafe {
-            let mut input = ffi::av_frame_clone(frame);
-            if input.is_null() {
-                bail!("av_frame_clone failed");
-            }
-            (*input).pts = pts;
-            let e = ffi::av_buffersrc_add_frame_flags(self.src, input, 0);
-            ffi::av_frame_free(&mut input);
-            if e < 0 {
-                bail!("scale_cuda input: {}", av_err(e));
-            }
-            let mut out = ff::frame::Video::empty();
-            let e = ffi::av_buffersink_get_frame(self.sink, out.as_mut_ptr());
-            if e == ffi::AVERROR(ffi::EAGAIN) {
-                return Ok(None);
-            }
-            if e < 0 {
-                bail!("scale_cuda output: {}", av_err(e));
-            }
-            Ok(Some(out))
-        }
-    }
-}
-
-impl Drop for GpuScaler {
-    fn drop(&mut self) {
-        // `out_frames` belongs to the sink, freed with the graph.
-        unsafe { ffi::avfilter_graph_free(&mut self.graph) };
-    }
-}
-
-/// swscale from our packed layouts (NV12 / NV16 / NV24) to NV12 at the output size.
+/// swscale from our packed layouts (NV12 / NV16 / NV24) to limited-range NV12 at the output size.
 struct CpuScaler {
     sws: *mut ffi::SwsContext,
     frame: ff::frame::Video,
@@ -506,7 +406,7 @@ struct CpuScaler {
 unsafe impl Send for CpuScaler {}
 
 impl CpuScaler {
-    fn new(src_w: u32, src_h: u32, chroma: Chroma, w: u32, h: u32) -> Result<Self> {
+    fn new(src_w: u32, src_h: u32, chroma: Chroma, color: crate::color::ColorInfo, w: u32, h: u32) -> Result<Self> {
         let src_fmt = match chroma {
             Chroma::S420 => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
             Chroma::S422 => ffi::AVPixelFormat::AV_PIX_FMT_NV16,
@@ -528,6 +428,12 @@ impl CpuScaler {
         };
         if sws.is_null() {
             bail!("sws_getContext {src_w}x{src_h} -> {w}x{h} failed");
+        }
+        unsafe {
+            // Same matrix, full range in -> limited range out.
+            let cs = if color.matrix == Matrix::Bt709 { ffi::SWS_CS_ITU709 } else { ffi::SWS_CS_ITU601 } as i32;
+            let table = ffi::sws_getCoefficients(cs);
+            ffi::sws_setColorspaceDetails(sws, table, color.full_range as i32, table, 0, 0, 1 << 16, 1 << 16);
         }
         Ok(Self { sws, frame: ff::frame::Video::new(ff::format::Pixel::NV12, w, h), src_w, src_h, chroma })
     }

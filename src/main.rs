@@ -5,6 +5,7 @@ mod capture;
 mod clock;
 mod color;
 mod config;
+mod cuda_filter;
 mod encode;
 mod game_fps;
 mod gpu;
@@ -131,7 +132,7 @@ fn main() -> Result<()> {
         attach_console();
         let arg = |name: &str| args.iter().position(|a| a == name).and_then(|j| args.get(j + 1)).cloned();
         let dir = arg("--vfg-dir").map(std::path::PathBuf::from).or(Config::load().frame_gen_dir);
-        return gpu::self_test(dir.as_deref());
+        return gpu::self_test(dir.as_deref(), args.iter().any(|a| a == "--range"));
     }
     if args.iter().any(|a| a == "--frame-gen-test") {
         attach_console();

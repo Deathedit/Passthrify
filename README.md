@@ -155,6 +155,10 @@ WASAPI capture ─┬─► passthrough ring ─► WASAPI render
 - The replay buffer holds **encoded** packets (4K60 HEVC at 50 Mbps ≈ 375 MB per minute) and
   always starts on a keyframe (1 s GOP). Saving a replay just remuxes, with no re-encode.
 - Recordings are fragmented MP4: a crash leaves a playable file.
+- Recordings, replays and the stream are written in limited range (16-235). The 4K X sends 4:2:0
+  as full range (0-255), and many players ignore the full-range flag and show such files too
+  dark, so Passthrify converts it on the GPU (`colorspace_cuda`), or on the CPU without CUDA.
+  The preview and screenshots use the full range as captured.
 - Each captured frame lands in page-locked memory and is uploaded to the GPU once (CUDA, about
   0.5 ms at 4K). NVENC and frame generation both read that copy, so the encoder does no CPU copy
   of its own: about 0.2 ms of CPU per 4K frame instead of 1.4 ms. The log shows per-frame timings
