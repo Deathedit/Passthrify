@@ -2,7 +2,8 @@
 
 Low-latency viewer for Elgato capture cards (4K X / 4K60 S+ / 4K60 Pro mk2) with a
 ShadowPlay-style instant replay, manual recording, audio passthrough and screenshots.
-Rust, Media Foundation + WASAPI capture, NVENC encoding via FFmpeg, egui/wgpu UI.
+Rust, NVENC encoding via FFmpeg, egui/wgpu UI. Windows (Media Foundation + WASAPI capture)
+and Linux (V4L2 + PipeWire).
 
 ## Install
 
@@ -16,6 +17,47 @@ Download from [Releases](https://github.com/Deathedit/Passthrify/releases):
 
 Both update themselves from inside the app (Settings › Updates). Uninstalling keeps your
 settings in `%APPDATA%\Passthrify`; delete that folder too for a clean slate.
+
+### Linux
+
+x86_64 with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Arch, …), PipeWire, and an NVIDIA
+GPU with the proprietary driver. Any V4L2/UVC capture card works; Elgato cards are picked by
+default.
+
+- **`Passthrify-<version>-x86_64.AppImage`**: one file. `chmod +x` it and run it. Without FUSE,
+  run it with `--appimage-extract-and-run`.
+- **`Passthrify-<version>-linux-x86_64.tar.gz`**: unpack anywhere and run
+  `Passthrify/passthrify`. For a menu entry, copy `passthrify.desktop` to
+  `~/.local/share/applications/` with `Exec=` pointing at the binary.
+- **Nix**: `nix run github:Deathedit/Passthrify`, or add the flake to your configuration.
+
+The AppImage and the tarball update themselves; a Nix install updates with your flake.
+Settings live in `~/.config/passthrify`.
+
+- **Card access:** your user needs read access to `/dev/video*`, usually through the `video`
+  group (`sudo usermod -aG video $USER`, then log in again). A card can be open in one app at
+  a time, so close OBS first.
+- **Hotkeys:** X11 sessions get the same global hotkeys as Windows. Wayland doesn't let apps
+  grab keys, so bind the commands in your compositor instead (Settings › Hotkeys lists them):
+
+  ```kdl
+  // niri (~/.config/niri/config.kdl)
+  binds {
+      Alt+F10 { spawn "passthrify" "--action" "save-replay"; }
+      Alt+F9  { spawn "passthrify" "--action" "toggle-record"; }
+  }
+  ```
+
+  Sway / Hyprland: `bindsym` / `bind` with `exec passthrify --action save-replay`. The actions
+  are `save-replay`, `toggle-record`, `screenshot`, `toggle-stream` and `show`. Launching
+  Passthrify a second time brings the running window to the front.
+- **Title bar:** by default the window manager draws it (none on tiling ones like niri,
+  Hyprland or Sway), except on GNOME, where Passthrify draws its own. Settings › Display ›
+  Title bar overrides it.
+- **Tray, notifications, stream key:** the tray icon needs a StatusNotifierItem host (KDE,
+  Waybar, GNOME with the AppIndicator extension). Stream keys are kept in the Secret Service
+  keyring (GNOME Keyring, KWallet, KeePassXC); see them with
+  `secret-tool search service Passthrify`.
 
 ## Use
 
@@ -100,6 +142,7 @@ keep the real frames.
 
 ```
 passthrify --list-devices            # capture devices, all native modes, audio endpoints
+passthrify --action save-replay      # (Linux) tell the running app to save a replay, etc.
 passthrify --selftest 30 --out DIR   # headless: capture+encode 30 s, record, save replay + screenshot
 passthrify --gpu-test                # no card needed: encode synthetic frames via system memory and
                                      # CUDA frames, compare CPU time per frame
@@ -141,6 +184,25 @@ cargo run                 # debug build shows a console with logs
 cargo build --release     # target/release/passthrify.exe (+ FFmpeg DLLs copied next to it)
 ```
 
+### Linux
+
+Needs Rust stable, a C toolchain, clang/libclang, pkg-config and the PipeWire development files
+(Debian/Ubuntu: `sudo apt install build-essential clang libclang-dev pkg-config libpipewire-0.3-dev`).
+`build.sh` downloads FFmpeg 8.1 (BtbN's LGPL shared build, as on Windows) into
+`third_party/ffmpeg-linux`, runs the tests, builds the release binary and packages
+`dist/Passthrify/` with FFmpeg in `lib/`:
+
+```
+./build.sh                       # test + release build + dist/Passthrify
+./build.sh --tarball --appimage  # also the release tarball and AppImage (+ .sha256 each)
+./build.sh --skip-tests          # no cargo test
+```
+
+On NixOS, `nix develop` gives a shell with everything (FFmpeg from nixpkgs), so
+`cargo run` works directly, and `nix build` builds the flake package. `nix develop -c
+./build.sh` also works, but its packages only run on NixOS; portable ones come from CI on
+Ubuntu 24.04.
+
 ## How it works
 
 ```
@@ -178,6 +240,9 @@ Settings → **Updates** checks GitHub Releases at startup (can be turned off) o
   `.sha256`. It then restarts into the new version, keeping your settings and any other files
   in the folder. For a copy installed with the setup it also updates the version shown in
   Settings › Apps.
+- On Linux it downloads the package matching the install: the tarball replaces the files in
+  its folder the same way, and an AppImage is replaced by the new AppImage in place. A Nix
+  install (in `/nix/store`) is updated with the flake instead.
 - Builds check `Deathedit/Passthrify` (`PASSTHRIFY_REPO` in `.cargo/config.toml`; the workflow
   sets it from the repo it runs in, so a fork points at itself). To use another repo, set
   `update_repo = "owner/name"` in the app's config.toml. To check from the
@@ -212,4 +277,6 @@ dev builds are kept.
 
 - HDR (P010) capture/encode. Use SDR output, or let the card tone-map.
 - AMD/Intel encoders and older DirectShow-only Elgato cards (HD60 S, HD60 Pro).
+- On Linux: frame generation (NVIDIA's SDK is Windows-only) and the 4K60 Pro mk2 (PCIe, no
+  Linux driver).
 - Full zero-copy: Elgato's driver delivers frames in system memory, so one upload is the minimum.
