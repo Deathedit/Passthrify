@@ -4,3 +4,5 @@
 *.mp4
 *.png
 !assets/*.png
+/third_party/ffmpeg-linux
+/third_party/appimagetool-x86_64.AppImage

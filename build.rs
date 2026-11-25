@@ -55,7 +55,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PASSTHRIFY_BUNDLE_LIBS");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         if env::var_os("PASSTHRIFY_BUNDLE_LIBS").is_some() {
-            println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/lib");
+            // DT_RPATH, not RUNPATH: a RUNPATH only covers the binary's own dependencies, and
+            // the bundled libavcodec needs the bundled libswresample too.
+            println!("cargo:rustc-link-arg-bins=-Wl,--disable-new-dtags,-rpath,$ORIGIN/lib");
         }
         // The DLL copy below is for Windows; Linux links against FFMPEG_DIR/lib (or pkg-config).
         return;

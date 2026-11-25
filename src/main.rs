@@ -82,6 +82,13 @@ fn main() -> Result<()> {
         attach_console();
         return list_devices();
     }
+    if let Some(i) = args.iter().position(|a| a == "--render-icon") {
+        // Packaging (build.sh): the app icon as a PNG, from the same SVG the window uses.
+        let size: u32 = args.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| anyhow!("--render-icon SIZE OUT.png"))?;
+        let out = args.get(i + 2).ok_or_else(|| anyhow!("--render-icon SIZE OUT.png"))?;
+        image::save_buffer(out, &tray::app_icon_rgba(size), size, size, image::ColorType::Rgba8)?;
+        return Ok(());
+    }
     if let Some(i) = args.iter().position(|a| a == "--action") {
         attach_console();
         let name = args.get(i + 1).ok_or_else(|| anyhow!("--action needs a name (see --help)"))?;
