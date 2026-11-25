@@ -312,7 +312,7 @@ impl SettingsUi {
             ui.add_space(6.0);
 
             theme::field_label(ui, "Input range");
-            egui::ComboBox::from_id_salt("s_range").selected_text(d.color_range.label()).width(w).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("s_range").selected_text(d.color_range.label()).width(w).truncate().show_ui(ui, |ui| {
                 for r in RangePref::ALL {
                     ui.selectable_value(&mut d.color_range, r, r.label());
                 }
@@ -590,7 +590,7 @@ impl SettingsUi {
             ui.add_space(10.0);
             theme::field_label(ui, "Presentation");
             let w = ui.available_width();
-            egui::ComboBox::from_id_salt("s_present").selected_text(present_label(d.present_mode)).width(w).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("s_present").selected_text(present_label(d.present_mode)).width(w).truncate().show_ui(ui, |ui| {
                 for p in [PresentMode::Mailbox, PresentMode::Immediate, PresentMode::Fifo] {
                     ui.selectable_value(&mut d.present_mode, p, present_label(p));
                 }
@@ -867,7 +867,7 @@ fn frame_gen_fields(ui: &mut egui::Ui, d: &mut Config, fg: &crate::vfg::FrameGen
         ui.add_space(4.0);
         theme::field_label(ui, "Output");
         let mult_label = |m: u32| format!("x{m}");
-        egui::ComboBox::from_id_salt("s_fg_mult").selected_text(mult_label(d.frame_gen_multiplier)).width(w).show_ui(
+        egui::ComboBox::from_id_salt("s_fg_mult").selected_text(mult_label(d.frame_gen_multiplier)).width(w).truncate().show_ui(
             ui,
             |ui| {
                 for m in 2..=4 {
@@ -876,7 +876,7 @@ fn frame_gen_fields(ui: &mut egui::Ui, d: &mut Config, fg: &crate::vfg::FrameGen
             },
         );
         theme::field_label(ui, "Model");
-        egui::ComboBox::from_id_salt("s_fg_quality").selected_text(d.frame_gen_quality.label()).width(w).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("s_fg_quality").selected_text(d.frame_gen_quality.label()).width(w).truncate().show_ui(ui, |ui| {
             for q in Quality::ALL {
                 ui.selectable_value(&mut d.frame_gen_quality, q, q.label());
             }
@@ -969,12 +969,14 @@ fn present_label(p: PresentMode) -> &'static str {
 
 fn optional_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, options: &[String], auto: &str, width: f32) {
     let text = value.clone().unwrap_or_else(|| auto.to_string());
-    egui::ComboBox::from_id_salt(id).selected_text(text).width(width).show_ui(ui, |ui| {
+    // Device names can be long (PipeWire's especially): truncated in the box, full on hover.
+    let resp = egui::ComboBox::from_id_salt(id).selected_text(text.as_str()).width(width).truncate().show_ui(ui, |ui| {
         ui.selectable_value(value, None, auto);
         for o in options {
             ui.selectable_value(value, Some(o.clone()), o);
         }
     });
+    resp.response.on_hover_text(text);
 }
 
 #[cfg(test)]

@@ -35,6 +35,8 @@ pub struct App {
     sidebar_open: bool,
     /// Sidebar state to restore when leaving fullscreen.
     sidebar_before_fullscreen: bool,
+    /// The window's fullscreen state as last reported, to notice the window manager changing it.
+    seen_fullscreen: Option<bool>,
     /// The first frame has not run yet (the window size is unknown until then).
     first_frame: bool,
     /// egui time until which the show-sidebar button stays visible.
@@ -235,6 +237,7 @@ impl App {
             announced_update: None,
             sidebar_open: true,
             sidebar_before_fullscreen: true,
+            seen_fullscreen: None,
             first_frame: true,
             show_button_until: 0.0,
             cursor_moved_at: 0.0,
@@ -257,8 +260,15 @@ impl App {
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        if self.follow_fullscreen(on) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        }
+    }
+
+    /// Switches the layout in or out of fullscreen; false if it already was.
+    fn follow_fullscreen(&mut self, on: bool) -> bool {
         if on == self.fullscreen {
-            return;
+            return false;
         }
         // The sidebar steps aside in fullscreen and comes back afterwards.
         if on {
@@ -268,7 +278,7 @@ impl App {
             self.sidebar_open = self.sidebar_before_fullscreen;
         }
         self.fullscreen = on;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        true
     }
 
     /// Shows or hides the sidebar at the user's request (remembered in the config).
@@ -1155,6 +1165,14 @@ impl eframe::App for App {
                 let outcome = s.poll(ctx);
                 self.handle_settings(outcome);
             }
+        }
+
+        // The window manager can enter or leave fullscreen on its own (niri's fullscreen key,
+        // moving the window): follow it, or the title bar stays hidden on a normal window.
+        let reported = ctx.input(|i| i.viewport().fullscreen);
+        if reported.is_some() && reported != self.seen_fullscreen {
+            self.seen_fullscreen = reported;
+            self.follow_fullscreen(reported == Some(true));
         }
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
