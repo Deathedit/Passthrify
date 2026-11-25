@@ -1206,6 +1206,8 @@ impl eframe::App for App {
                 (3.0 * CAPTION_BUTTON_W * ppp).round() as i32,
                 !maximized,
             );
+        }
+        if !self.fullscreen {
             egui::TopBottomPanel::bottom("status")
                 .frame(
                     egui::Frame::new()
