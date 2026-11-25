@@ -275,6 +275,7 @@ pub fn run_capture_loop<D: Device>(
         let mut dev = match opened {
             Ok(d) => d,
             Err(e) => {
+                tracing::warn!("video capture: {e:#}");
                 on_open(Err(e));
                 sleep_unless_stopped(&stop, 2000);
                 continue;

@@ -451,3 +451,64 @@ impl Interop {
         }
     }
 }
+
+/// Linux: the wgpu device the UI renders with, created here rather than by eframe so it also
+/// enables VK_KHR_external_memory_fd, which wgpu doesn't turn on by itself but the preview
+/// buffer shared with CUDA needs ([`Interop::create`]). Same extensions, features and limits as
+/// eframe's own setup otherwise. None (eframe's setup, CPU uploads) if anything is missing.
+#[cfg(target_os = "linux")]
+pub fn linux_wgpu_setup() -> Option<egui_wgpu::WgpuSetup> {
+    let res = (|| -> anyhow::Result<egui_wgpu::WgpuSetup> {
+        use anyhow::{anyhow, Context};
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::from_build_config().with_env(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+        });
+        // Prefer the discrete GPU (the NVIDIA one, which CUDA and NVENC use).
+        let mut adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
+        adapters.sort_by_key(|a| match a.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
+        });
+        let adapter = adapters.into_iter().next().ok_or_else(|| anyhow!("no Vulkan adapter"))?;
+        let desc = wgpu::DeviceDescriptor {
+            label: Some("egui wgpu device"),
+            required_features: wgpu::Features::default(),
+            required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, ..wgpu::Limits::default() },
+            memory_hints: wgpu::MemoryHints::default(),
+        };
+        let open = unsafe {
+            adapter.as_hal::<hal::api::Vulkan, _, _>(|a| -> anyhow::Result<_> {
+                let a = a.ok_or_else(|| anyhow!("not a Vulkan adapter"))?;
+                let raw_instance = a.shared_instance().raw_instance();
+                let mut exts = a.required_device_extensions(desc.required_features);
+                let available = raw_instance
+                    .enumerate_device_extension_properties(a.raw_physical_device())
+                    .context("listing device extensions")?;
+                let fd = ash::khr::external_memory_fd::NAME;
+                if !available.iter().any(|e| e.extension_name_as_c_str() == Ok(fd)) {
+                    anyhow::bail!("the GPU doesn't offer {}", fd.to_string_lossy());
+                }
+                if !exts.contains(&fd) {
+                    exts.push(fd);
+                }
+                let mut features = a.physical_device_features(&exts, desc.required_features);
+                let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
+                let names: Vec<_> = exts.iter().map(|e| e.as_ptr()).collect();
+                let info = features.add_to_device_create(
+                    vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&names),
+                );
+                let raw = raw_instance.create_device(a.raw_physical_device(), &info, None).context("vkCreateDevice")?;
+                a.device_from_raw(raw, None, &exts, desc.required_features, &desc.memory_hints, 0, 0)
+                    .map_err(|e| anyhow!("wrapping the Vulkan device: {e}"))
+            })?
+        };
+        let (device, queue) = unsafe { adapter.create_device_from_hal(open, &desc, None) }.context("creating the wgpu device")?;
+        tracing::info!("UI on {} (Vulkan, with external memory for the preview)", adapter.get_info().name);
+        Ok(egui_wgpu::WgpuSetup::Existing(egui_wgpu::WgpuSetupExisting { instance, adapter, device, queue }))
+    })();
+    res.map_err(|e| tracing::warn!("Vulkan device with external memory unavailable ({e:#}); the preview uploads from the CPU"))
+        .ok()
+}

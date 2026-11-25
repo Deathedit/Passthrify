@@ -130,13 +130,14 @@ fn find_node(flow: Flow, pref: Option<&str>, video_device: Option<&str>) -> Resu
         Flow::Render => Ok(None),
         Flow::Capture => {
             let vd = video_device.map(|v| v.to_lowercase());
+            let names: Vec<String> = all.iter().map(|n| n.description.clone()).collect();
             all.into_iter()
                 .find(|n| {
                     super::looks_like_elgato(&n.description)
                         || vd.as_deref().is_some_and(|v| n.description.to_lowercase().contains(v))
                 })
                 .map(Some)
-                .ok_or_else(|| anyhow!("no capture-card audio device found; pick one in Settings"))
+                .ok_or_else(|| anyhow!("no capture-card audio device found (have: {names:?}); pick one in Settings"))
         }
     }
 }

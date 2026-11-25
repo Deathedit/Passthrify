@@ -186,6 +186,12 @@ fn run_gui() -> Result<()> {
 /// Linux: Vulkan only (not GL), as the preview shares its frame buffer with CUDA through
 /// Vulkan. `WGPU_BACKEND` still overrides it. Windows keeps wgpu's default choice.
 fn wgpu_setup() -> egui_wgpu::WgpuSetup {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        if let Some(setup) = ui::preview::linux_wgpu_setup() {
+            return setup;
+        }
+    }
     let mut setup = egui_wgpu::WgpuSetupCreateNew::default();
     if cfg!(target_os = "linux") && std::env::var_os("WGPU_BACKEND").is_none() {
         setup.instance_descriptor.backends = wgpu::Backends::VULKAN;
