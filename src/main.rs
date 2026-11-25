@@ -196,9 +196,10 @@ fn run_gui() -> Result<()> {
             .with_app_id("passthrify")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([480.0, 300.0])
-            // Linux: egui draws the title bar and border (ui/frame_linux.rs). Windows removes
-            // the native caption itself (ui/frame.rs) and keeps the frame's shadow and snapping.
-            .with_decorations(cfg!(windows))
+            // Windows removes the native caption itself (ui/frame.rs) and keeps the frame's
+            // shadow and snapping. Linux: the window manager's decorations (none on tiling ones),
+            // or egui draws the title bar and border (ui/frame_linux.rs); see TitleBar.
+            .with_decorations(cfg!(windows) || !cfg.title_bar.app_drawn())
             .with_icon(Arc::new(egui::IconData { rgba: tray::app_icon_rgba(128), width: 128, height: 128 })),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             present_mode,

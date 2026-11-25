@@ -148,6 +148,38 @@ pub enum PresentMode {
     Fifo,
 }
 
+/// Who draws the window's title bar and edges. Linux only: on Windows Passthrify always draws
+/// its own inside the native frame (ui/frame.rs).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TitleBar {
+    /// The window manager's, except on GNOME, which leaves title bars to apps.
+    #[default]
+    Auto,
+    /// Passthrify's own title bar and border.
+    App,
+    /// The window manager's: none on tiling ones like niri, Hyprland or Sway.
+    System,
+}
+
+impl TitleBar {
+    /// Passthrify draws the title bar (and window border) itself.
+    pub fn app_drawn(self) -> bool {
+        if cfg!(windows) {
+            return true;
+        }
+        match self {
+            TitleBar::App => true,
+            TitleBar::System => false,
+            TitleBar::Auto => gnome_session(),
+        }
+    }
+}
+
+/// GNOME (and Ubuntu's GNOME) has no window-manager title bars on Wayland.
+fn gnome_session() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|s| s.eq_ignore_ascii_case("gnome")))
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct ModePref {
     pub width: u32,
@@ -191,6 +223,7 @@ pub struct Config {
 
     pub windows_notifications: bool,
     pub present_mode: PresentMode,
+    pub title_bar: TitleBar,
 
     /// Which releases to offer: stable only, or pre-releases too.
     pub update_channel: crate::updater::UpdateChannel,
@@ -261,6 +294,7 @@ impl Default for Config {
             hotkey_toggle_stream: "Alt+F8".into(),
             windows_notifications: true,
             present_mode: PresentMode::Mailbox,
+            title_bar: TitleBar::Auto,
             update_channel: crate::updater::UpdateChannel::Stable,
             check_updates: true,
             update_repo: None,

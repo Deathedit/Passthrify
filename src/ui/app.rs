@@ -39,6 +39,9 @@ pub struct App {
     seen_fullscreen: Option<bool>,
     /// The first frame has not run yet (the window size is unknown until then).
     first_frame: bool,
+    /// The window manager decorates the window (Linux; follows the Title bar setting live).
+    #[cfg(target_os = "linux")]
+    native_decorations: bool,
     /// egui time until which the show-sidebar button stays visible.
     show_button_until: f64,
     /// egui time of the last mouse movement or click (hides the cursor over the video when idle).
@@ -188,6 +191,8 @@ impl App {
             });
         }
 
+        #[cfg(target_os = "linux")]
+        let native_decorations = !cfg.title_bar.app_drawn();
         let mut hotkey_errors = Vec::new();
         // Wayland: the compositor binds `passthrify --action …` instead (Settings › Hotkeys).
         let manager = if crate::hotkeys::wayland_session() { Ok(None) } else { Hotkeys::new(pipeline.sender()).map(Some) };
@@ -239,6 +244,8 @@ impl App {
             sidebar_before_fullscreen: true,
             seen_fullscreen: None,
             first_frame: true,
+            #[cfg(target_os = "linux")]
+            native_decorations,
             show_button_until: 0.0,
             cursor_moved_at: 0.0,
         };
@@ -784,7 +791,7 @@ impl App {
         let p = ui.painter();
         p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, theme::DIVIDER));
         let cy = rect.center().y;
-        let logo = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, cy), egui::Vec2::splat(16.0));
+        let logo = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, cy), theme::mark_size(16.0));
         let tint = if focused { Color32::WHITE } else { Color32::from_white_alpha(140) };
         theme::mark_image(16.0).tint(tint).paint_at(ui, logo);
         let title_color = if focused { theme::TEXT2 } else { theme::TEXT3 };
@@ -979,7 +986,7 @@ impl App {
                     (None, _) => ("Waiting for video…".to_string(), String::new()),
                 };
                 let c = rect.center();
-                let img = egui::Rect::from_center_size(c - egui::vec2(0.0, 40.0), egui::Vec2::splat(72.0));
+                let img = egui::Rect::from_center_size(c - egui::vec2(0.0, 40.0), theme::mark_size(72.0));
                 theme::mark_image(72.0).tint(Color32::from_white_alpha(90)).paint_at(ui, img);
                 let p = ui.painter();
                 p.text(c + egui::vec2(0.0, 12.0), egui::Align2::CENTER_CENTER, title, FontId::new(16.0, theme::semibold()), theme::TEXT2);
@@ -1096,6 +1103,7 @@ impl App {
                 c.stream_fps = 0;
                 c.stream_bitrate_kbps = 0;
                 c.present_mode = crate::config::PresentMode::Mailbox;
+                c.title_bar = crate::config::TitleBar::Auto;
                 c.windows_notifications = false;
                 c.sidebar_open = false;
                 // Frame generation applies live (FrameGen::configure).
@@ -1175,8 +1183,15 @@ impl eframe::App for App {
             self.follow_fullscreen(reported == Some(true));
         }
 
+        let app_title_bar = self.cfg.title_bar.app_drawn();
+        #[cfg(target_os = "linux")]
+        if self.native_decorations == app_title_bar {
+            self.native_decorations = !app_title_bar;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!app_title_bar));
+        }
+
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        if self.fullscreen {
+        if self.fullscreen || !app_title_bar {
             super::frame::set_layout(0, 0, false);
         } else {
             egui::TopBottomPanel::top("title_bar")
@@ -1230,7 +1245,7 @@ impl eframe::App for App {
         self.toasts(ctx);
 
         // Our 1 px window border (the native one is gone); none when maximized or fullscreen.
-        if !self.fullscreen && !maximized {
+        if !self.fullscreen && !maximized && app_title_bar {
             #[cfg(target_os = "linux")]
             super::frame::resize_edges(ctx);
             ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))).rect_stroke(

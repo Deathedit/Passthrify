@@ -12,7 +12,7 @@ use super::pickers;
 use super::theme::{self, icons, Kind};
 use crate::capture::VideoMode;
 use crate::color::{ColorInfo, RangePref};
-use crate::config::{Chroma, Codec, Config, PresentMode, StreamService};
+use crate::config::{Chroma, Codec, Config, PresentMode, StreamService, TitleBar};
 use crate::updater::{self, UpdateChannel, UpdateState, Updater};
 
 pub enum SettingsOutcome {
@@ -256,6 +256,7 @@ impl SettingsUi {
             Section::Display => {
                 d.windows_notifications = def.windows_notifications;
                 d.present_mode = def.present_mode;
+                d.title_bar = def.title_bar;
                 d.frame_gen = def.frame_gen;
                 d.frame_gen_quality = def.frame_gen_quality;
                 d.frame_gen_multiplier = def.frame_gen_multiplier;
@@ -596,6 +597,20 @@ impl SettingsUi {
                 }
             });
             ui.label(RichText::new("Takes effect after restarting Passthrify.").size(12.0).color(theme::TEXT3));
+            if cfg!(target_os = "linux") {
+                ui.add_space(10.0);
+                theme::field_label(ui, "Title bar");
+                egui::ComboBox::from_id_salt("s_title_bar").selected_text(title_bar_label(d.title_bar)).width(w).truncate().show_ui(ui, |ui| {
+                    for t in [TitleBar::Auto, TitleBar::System, TitleBar::App] {
+                        ui.selectable_value(&mut d.title_bar, t, title_bar_label(t));
+                    }
+                });
+                ui.label(
+                    RichText::new("Auto leaves it to the window manager (none on niri, Hyprland or Sway), except on GNOME, which needs Passthrify's own.")
+                        .size(12.0)
+                        .color(theme::TEXT3),
+                );
+            }
         });
     }
 
@@ -957,6 +972,14 @@ fn folder_row(ui: &mut egui::Ui, path: &mut std::path::PathBuf) -> bool {
         theme::button(ui, Kind::Secondary, Some(icons::FOLDER), "", None).on_hover_text("Open folder").clicked()
     })
     .inner
+}
+
+fn title_bar_label(t: TitleBar) -> &'static str {
+    match t {
+        TitleBar::Auto => "Auto",
+        TitleBar::System => "Window manager's",
+        TitleBar::App => "Passthrify's own",
+    }
 }
 
 fn present_label(p: PresentMode) -> &'static str {

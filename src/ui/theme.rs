@@ -211,8 +211,14 @@ pub fn icon_image(icon: (&'static str, &'static [u8]), size: f32, tint: Color32)
     egui::Image::from_bytes(sized_uri(icon.0, size), icon.1).fit_to_exact_size(Vec2::splat(size)).tint(tint)
 }
 
-pub fn mark_image(size: f32) -> egui::Image<'static> {
-    egui::Image::from_bytes(sized_uri(MARK_GLYPH.0, size), MARK_GLYPH.1).fit_to_exact_size(Vec2::splat(size))
+/// The mark `height` points tall. It's taller than wide (34x42 viewBox): paint it into a rect
+/// of [`mark_size`], not a square, or it comes out squashed.
+pub fn mark_image(height: f32) -> egui::Image<'static> {
+    egui::Image::from_bytes(sized_uri(MARK_GLYPH.0, height), MARK_GLYPH.1).fit_to_exact_size(mark_size(height))
+}
+
+pub fn mark_size(height: f32) -> Vec2 {
+    Vec2::new(height * 34.0 / 42.0, height)
 }
 
 // --- Widgets -------------------------------------------------------------------------------
