@@ -210,10 +210,13 @@ pub fn chroma_picker(
             }
         }
     });
-    resp.response.on_hover_text(
+    resp.response.on_hover_text(if cfg!(windows) {
         "Chroma subsampling. The resolution and frame-rate lists show only modes that deliver it.\n\
-         4:2:2 / 4:4:4 files need VLC, mpv, MPC-HC or a pro editor; Windows' built-in player only decodes 4:2:0.",
-    );
+         4:2:2 / 4:4:4 files need VLC, mpv, MPC-HC or a pro editor; Windows' built-in player only decodes 4:2:0."
+    } else {
+        "Chroma subsampling. The resolution and frame-rate lists show only modes that deliver it.\n\
+         4:2:2 / 4:4:4 files need mpv, VLC or a pro editor; many players and browsers only decode 4:2:0."
+    });
     changed
 }
 

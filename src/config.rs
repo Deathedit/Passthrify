@@ -168,7 +168,7 @@ pub struct Config {
     pub color_range: crate::color::RangePref,
     /// Audio capture endpoint name substring; None = auto-match the capture card.
     pub audio_input: Option<String>,
-    /// Audio render endpoint for passthrough; None = Windows default output.
+    /// Audio render endpoint for passthrough; None = the system's default output.
     pub audio_output: Option<String>,
     pub passthrough_enabled: bool,
     pub volume: f32,
@@ -215,7 +215,7 @@ pub struct Config {
     pub gpu_frames: bool,
 
     /// Live streaming: service, Custom server URL, output height (0 = source), max frame rate
-    /// and video bitrate. The stream key lives in Windows Credential Manager, not here.
+    /// and video bitrate. The stream key lives in the system's credential store (secrets.rs), not here.
     pub stream_service: StreamService,
     pub stream_server: String,
     pub stream_height: u32,
@@ -226,15 +226,18 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let user = directories::UserDirs::new();
+        // Linux without XDG user dirs configured has no Videos/Pictures entry: use ~/Videos and
+        // ~/Pictures rather than the working directory.
+        let home = || user.as_ref().map(|d| d.home_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let output_dir = user
             .as_ref()
             .and_then(|d| d.video_dir().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(|| home().join("Videos"))
             .join("Passthrify");
         let screenshot_dir = user
             .as_ref()
             .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| output_dir.clone())
+            .unwrap_or_else(|| home().join("Pictures"))
             .join("Passthrify");
         Self {
             video_device: None,

@@ -5,6 +5,8 @@ mod capture;
 mod clock;
 mod color;
 mod config;
+#[cfg(unix)]
+mod control;
 mod cuda_filter;
 mod encode;
 mod game_fps;
@@ -19,6 +21,7 @@ mod recorder;
 mod replay;
 mod screenshot;
 mod secrets;
+mod shell;
 mod stream;
 mod svg_raster;
 mod tray;
@@ -42,6 +45,9 @@ Passthrify - Elgato capture viewer with instant replay
 USAGE:
   passthrify                    start the app
   passthrify --list-devices     list capture devices, their modes and audio endpoints
+  passthrify --action NAME      (Linux) tell the running app to: save-replay, toggle-record,
+                                screenshot, toggle-stream or show. Bind these in your desktop's
+                                keyboard shortcuts (Wayland has no app-grabbed global hotkeys)
   passthrify --check-update [--repo OWNER/NAME] [--channel stable|prerelease]
                                 check GitHub for a newer release
   passthrify --selftest [SECS] [--out DIR] [--mode WxH@FPS] [--chroma 420|422|444]
@@ -69,6 +75,14 @@ fn main() -> Result<()> {
         attach_console();
         return list_devices();
     }
+    if let Some(i) = args.iter().position(|a| a == "--action") {
+        attach_console();
+        let name = args.get(i + 1).ok_or_else(|| anyhow!("--action needs a name (see --help)"))?;
+        #[cfg(unix)]
+        return control::send(name);
+        #[cfg(not(unix))]
+        return Err(anyhow!("--action {name}: only on Linux; use the hotkeys on Windows"));
+    }
     if args.iter().any(|a| a == "--apply-update") {
         // Installer mode: runs from the staged copy of a new version (see updater.rs).
         init_logging(false, "update.log");
@@ -95,7 +109,26 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // One instance: a second launch brings the running one to the front. Checked before the
+    // log file is recreated, so it doesn't wipe the running instance's log.
+    #[cfg(unix)]
+    let control_err = if args.is_empty() {
+        match control::claim() {
+            Ok(true) => None,
+            Ok(false) => {
+                println!("Passthrify is already running; brought it to the front");
+                return Ok(());
+            }
+            Err(e) => Some(e),
+        }
+    } else {
+        None
+    };
     init_logging(!args.is_empty(), "passthrify.log");
+    #[cfg(unix)]
+    if let Some(e) = control_err {
+        tracing::warn!("control socket unavailable ({e:#}); --action won't reach this instance");
+    }
     install_panic_hook();
     ffmpeg_next::init()?;
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Warning);
@@ -175,12 +208,15 @@ fn run_gui() -> Result<()> {
         },
         ..Default::default()
     };
-    eframe::run_native(
+    let res = eframe::run_native(
         "Passthrify",
         options,
         Box::new(move |cc| Ok(Box::new(ui::app::App::new(cc, cfg, shared, pipeline)))),
     )
-    .map_err(|e| anyhow!("UI error: {e}"))
+    .map_err(|e| anyhow!("UI error: {e}"));
+    #[cfg(unix)]
+    control::release();
+    res
 }
 
 /// Linux: Vulkan only (not GL), as the preview shares its frame buffer with CUDA through

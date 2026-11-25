@@ -340,7 +340,7 @@ impl SettingsUi {
             ui.add_space(8.0);
             ui.add_enabled_ui(d.passthrough_enabled, |ui| {
                 theme::field_label(ui, "Output device");
-                optional_combo(ui, "s_audio_out", &mut d.audio_output, outputs, "Windows default", w);
+                optional_combo(ui, "s_audio_out", &mut d.audio_output, outputs, if cfg!(windows) { "Windows default" } else { "System default" }, w);
             });
         });
     }
@@ -479,14 +479,15 @@ impl SettingsUi {
                                 .sense(egui::Sense::click()),
                         );
                         if link.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                            let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+                            crate::shell::open_url(url);
                         }
                     });
                 }
             });
             let hint = if d.stream_service == StreamService::Custom { "Optional" } else { "Paste your stream key" };
             ui.add(egui::TextEdit::singleline(key).password(true).hint_text(hint).desired_width(w));
-            ui.label(RichText::new("Kept in Windows Credential Manager, not in the settings file.").size(12.0).color(theme::TEXT3));
+            let store = if cfg!(windows) { "Windows Credential Manager" } else { "the system keyring" };
+            ui.label(RichText::new(format!("Kept in {store}, not in the settings file.")).size(12.0).color(theme::TEXT3));
             ui.add_space(10.0);
 
             theme::field_label(ui, "Resolution");
@@ -501,6 +502,9 @@ impl SettingsUi {
     }
 
     fn hotkeys_card(&mut self, ui: &mut egui::Ui, hotkey_errors: &[String]) {
+        if crate::hotkeys::wayland_session() {
+            return wayland_hotkeys_card(ui);
+        }
         let capture = self.capture;
         let mut start: Option<Option<HotkeyField>> = None;
         let d = &mut self.draft;
@@ -582,7 +586,7 @@ impl SettingsUi {
         section_body(ui, |ui| {
             frame_gen_fields(ui, d, frame_gen);
             ui.add_space(14.0);
-            theme::toggle_row(ui, "Windows notification when a clip is saved", &mut d.windows_notifications);
+            theme::toggle_row(ui, if cfg!(windows) { "Windows notification when a clip is saved" } else { "Desktop notification when a clip is saved" }, &mut d.windows_notifications);
             ui.add_space(10.0);
             theme::field_label(ui, "Presentation");
             let w = ui.available_width();
@@ -987,3 +991,47 @@ mod tests {
         assert_eq!(hotkey_string(Key::R, Modifiers::NONE), None, "bare letters would fire while typing");
     }
 }
+
+/// Settings › Hotkeys on Wayland: apps can't grab global keys, so list the commands to bind in
+/// the compositor (control.rs serves them).
+#[cfg(target_os = "linux")]
+fn wayland_hotkeys_card(ui: &mut egui::Ui) {
+    section_body(ui, |ui| {
+        ui.label(
+            RichText::new(
+                "Wayland doesn't let apps grab global keys. Bind these commands in your desktop's \
+                 keyboard shortcuts instead; they work while a game or another window has focus.",
+            )
+            .size(12.0)
+            .color(theme::TEXT3),
+        );
+        ui.add_space(8.0);
+        for (name, what) in crate::control::ACTIONS {
+            let cmd = format!("passthrify --action {name}");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(cmd.as_str()).font(theme::mono(11.0)).color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let copy = ui.add(
+                        egui::Label::new(RichText::new("Copy").font(FontId::new(12.0, theme::medium())).color(theme::SIGNAL))
+                            .sense(egui::Sense::click()),
+                    );
+                    if copy.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(what).clicked() {
+                        ui.ctx().copy_text(cmd.clone());
+                    }
+                });
+            });
+            ui.label(RichText::new(what).size(12.0).color(theme::TEXT3));
+            ui.add_space(4.0);
+        }
+        ui.add_space(6.0);
+        theme::field_label(ui, "Example: niri (~/.config/niri/config.kdl)");
+        let example = "binds {\n    Alt+F10 { spawn \"passthrify\" \"--action\" \"save-replay\"; }\n    Alt+F9 { spawn \"passthrify\" \"--action\" \"toggle-record\"; }\n}";
+        egui::Frame::new().fill(theme::BASE).corner_radius(4).inner_margin(Margin::symmetric(8, 6)).show(ui, |ui| {
+            ui.label(RichText::new(example).font(theme::mono(11.0)).color(theme::TEXT2));
+        });
+        ui.label(RichText::new("Sway / Hyprland: bindsym / bind with exec, the same command.").size(12.0).color(theme::TEXT3));
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wayland_hotkeys_card(_: &mut egui::Ui) {}

@@ -148,7 +148,7 @@ pub fn hotkey_parts(s: &str) -> Vec<String> {
                 "control" | "ctrl" => "Ctrl".into(),
                 "alt" | "option" => "Alt".into(),
                 "shift" => "Shift".into(),
-                "super" | "meta" | "win" | "cmd" => "Win".into(),
+                "super" | "meta" | "win" | "cmd" => if cfg!(windows) { "Win" } else { "Super" }.into(),
                 _ => p.to_string(),
             }
         })
@@ -175,9 +175,23 @@ impl App {
         tray::style_title_bar(hwnd);
         super::frame::install(hwnd);
 
+        // `passthrify --action …` and second launches (control.rs).
+        #[cfg(unix)]
+        {
+            let ctx = cc.egui_ctx.clone();
+            crate::control::serve(pipeline.sender(), move || {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            });
+        }
+
         let mut hotkey_errors = Vec::new();
-        let hotkeys = match Hotkeys::new(pipeline.sender()) {
-            Ok(mut h) => {
+        // Wayland: the compositor binds `passthrify --action …` instead (Settings › Hotkeys).
+        let manager = if crate::hotkeys::wayland_session() { Ok(None) } else { Hotkeys::new(pipeline.sender()).map(Some) };
+        let hotkeys = match manager {
+            Ok(None) => None,
+            Ok(Some(mut h)) => {
                 hotkey_errors = h.apply(&cfg);
                 Some(h)
             }

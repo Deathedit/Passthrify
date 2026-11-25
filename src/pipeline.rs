@@ -589,8 +589,7 @@ impl Session {
     }
 
     fn open_folder(dir: &std::path::Path) {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+        crate::shell::open_folder(dir);
     }
 
     fn handle(&mut self, cmd: Command) {
