@@ -729,7 +729,7 @@ impl SettingsUi {
                     ui.add_space(8.0);
                     if let UpdateState::Downloading { progress, .. } = state {
                         // Text above a thin bar: text on the cyan fill itself would be unreadable.
-                        let total_mb = rel.zip_size as f64 / 1_048_576.0;
+                        let total_mb = rel.package_size as f64 / 1_048_576.0;
                         let done_mb = total_mb * progress as f64;
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Downloading…").size(12.0).color(egui::Color32::WHITE));
@@ -748,7 +748,7 @@ impl SettingsUi {
                         ui.painter().rect_filled(fill, 3, theme::SIGNAL);
                     } else {
                         let reason = if recording { Some("Stop the recording first.".to_string()) } else { blocker.clone() };
-                        let size_mb = rel.zip_size as f64 / 1_048_576.0;
+                        let size_mb = rel.package_size as f64 / 1_048_576.0;
                         let install = ui.add_enabled_ui(reason.is_none() && !downloading, |ui| {
                             theme::button(ui, Kind::Primary, Some(icons::DOWNLOAD), "Install and restart", Some(&format!("{size_mb:.0} MB")))
                         });

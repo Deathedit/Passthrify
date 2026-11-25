@@ -65,7 +65,14 @@ USAGE:
 
 fn main() -> Result<()> {
     clock::init();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Relaunched by the updater (AppImage): let the old copy exit first, then start normally.
+    if let Some(i) = args.iter().position(|a| a == "--wait-pid") {
+        if let Some(pid) = args.get(i + 1).and_then(|p| p.parse().ok()) {
+            updater::wait_for_exit(pid, Duration::from_secs(60));
+        }
+        args.drain(i..(i + 2).min(args.len()));
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         attach_console();
         print!("{USAGE}");
@@ -104,8 +111,11 @@ fn main() -> Result<()> {
         let releases = updater::fetch_releases(&repo)?;
         println!("{} release(s) found", releases.len());
         match updater::pick_release(&releases, channel, &updater::current_version()) {
-            Some(r) => println!("update available: {} ({} bytes) {}", r.tag, r.zip_size, r.url),
-            None => println!("up to date (no newer release with Passthrify-<ver>.zip + .sha256 assets)"),
+            Some(r) => println!("update available: {} ({} bytes) {}", r.tag, r.package_size, r.url),
+            None => println!(
+                "up to date (no newer release with {} + .sha256 assets)",
+                updater::InstallKind::current().package_name("<ver>")
+            ),
         }
         return Ok(());
     }
