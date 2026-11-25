@@ -5,16 +5,13 @@
 //! Frames come from an FFmpeg CUDA frames pool, so NVENC takes them as `AV_PIX_FMT_CUDA` input.
 //! The CUDA context is the device's primary context: the same one the CUDA runtime in the
 //! frame generation SDK uses, so its device pointers are valid there too. CUDA comes from
-//! nvcuda.dll, which ships with every NVIDIA driver.
+//! nvcuda.dll (Windows) or libcuda.so.1 (Linux), which ship with every NVIDIA driver.
 
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, Result};
 use ffmpeg_next::ffi as ff;
-use windows::core::{s, w};
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 
 use crate::capture::{Chroma, VideoFrame};
 
@@ -52,6 +49,53 @@ struct Driver {
     mem_free: unsafe extern "system" fn(u64) -> CuResult,
 }
 
+/// The CUDA driver library. Never unloaded: the driver lives for the whole process.
+struct CudaLib(*mut c_void);
+
+#[cfg(windows)]
+impl CudaLib {
+    const NAME: &'static str = "nvcuda.dll";
+
+    unsafe fn open() -> Result<Self> {
+        use windows::core::w;
+        use windows::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+        let lib = LoadLibraryExW(w!("nvcuda.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
+            .map_err(|e| anyhow!("{} not found (NVIDIA driver): {e}", Self::NAME))?;
+        Ok(Self(lib.0))
+    }
+
+    fn sym(&self, name: &CStr) -> Result<*mut c_void> {
+        use windows::core::PCSTR;
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::System::LibraryLoader::GetProcAddress;
+        let p = unsafe { GetProcAddress(HMODULE(self.0), PCSTR(name.as_ptr().cast())) };
+        p.map(|f| f as *mut c_void).ok_or_else(|| anyhow!("{} missing from {}", name.to_string_lossy(), Self::NAME))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CudaLib {
+    const NAME: &'static str = "libcuda.so.1";
+
+    unsafe fn open() -> Result<Self> {
+        let lib = libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if lib.is_null() {
+            let err = libc::dlerror();
+            let msg = if err.is_null() { "unknown error".into() } else { CStr::from_ptr(err).to_string_lossy() };
+            bail!("{} not found (NVIDIA driver): {msg}", Self::NAME);
+        }
+        Ok(Self(lib))
+    }
+
+    fn sym(&self, name: &CStr) -> Result<*mut c_void> {
+        let p = unsafe { libc::dlsym(self.0, name.as_ptr()) };
+        if p.is_null() {
+            bail!("{} missing from {}", name.to_string_lossy(), Self::NAME);
+        }
+        Ok(p)
+    }
+}
+
 fn driver() -> Result<&'static Driver> {
     static DRIVER: OnceLock<std::result::Result<Driver, String>> = OnceLock::new();
     DRIVER.get_or_init(|| unsafe { Driver::open() }.map_err(|e| format!("{e:#}"))).as_ref().map_err(|e| anyhow!("{e}"))
@@ -59,30 +103,30 @@ fn driver() -> Result<&'static Driver> {
 
 impl Driver {
     unsafe fn open() -> Result<Self> {
-        let lib = LoadLibraryExW(w!("nvcuda.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
-            .map_err(|e| anyhow!("nvcuda.dll not found (NVIDIA driver): {e}"))?;
-        unsafe fn sym<T>(lib: HMODULE, name: windows::core::PCSTR) -> Result<T> {
-            let p = GetProcAddress(lib, name).ok_or_else(|| anyhow!("{} missing from nvcuda.dll", name.display()))?;
+        let lib = CudaLib::open()?;
+        let sym = |name: &CStr| lib.sym(name);
+        unsafe fn cast<T>(p: Result<*mut c_void>) -> Result<T> {
+            let p = p?;
             Ok(std::mem::transmute_copy(&p))
         }
-        let init: unsafe extern "system" fn(u32) -> CuResult = sym(lib, s!("cuInit"))?;
-        let device_get: unsafe extern "system" fn(*mut i32, i32) -> CuResult = sym(lib, s!("cuDeviceGet"))?;
+        let init: unsafe extern "system" fn(u32) -> CuResult = cast(sym(c"cuInit"))?;
+        let device_get: unsafe extern "system" fn(*mut i32, i32) -> CuResult = cast(sym(c"cuDeviceGet"))?;
         let retain: unsafe extern "system" fn(*mut CuContext, i32) -> CuResult =
-            sym(lib, s!("cuDevicePrimaryCtxRetain"))?;
+            cast(sym(c"cuDevicePrimaryCtxRetain"))?;
         let stream_create: unsafe extern "system" fn(*mut CuStream, u32) -> CuResult =
-            sym(lib, s!("cuStreamCreate"))?;
-        let push: unsafe extern "system" fn(CuContext) -> CuResult = sym(lib, s!("cuCtxPushCurrent_v2"))?;
-        let pop: unsafe extern "system" fn(*mut CuContext) -> CuResult = sym(lib, s!("cuCtxPopCurrent_v2"))?;
-        let event_create: unsafe extern "system" fn(*mut CuEvent, u32) -> CuResult = sym(lib, s!("cuEventCreate"))?;
-        let event_record = sym(lib, s!("cuEventRecord"))?;
-        let event_sync = sym(lib, s!("cuEventSynchronize"))?;
-        let host_alloc = sym(lib, s!("cuMemHostAlloc"))?;
-        let host_free = sym(lib, s!("cuMemFreeHost"))?;
-        let memcpy2d_async = sym(lib, s!("cuMemcpy2DAsync_v2"))?;
-        let import_ext_mem = sym(lib, s!("cuImportExternalMemory"))?;
-        let ext_mem_buffer = sym(lib, s!("cuExternalMemoryGetMappedBuffer"))?;
-        let destroy_ext_mem = sym(lib, s!("cuDestroyExternalMemory"))?;
-        let mem_free = sym(lib, s!("cuMemFree_v2"))?;
+            cast(sym(c"cuStreamCreate"))?;
+        let push: unsafe extern "system" fn(CuContext) -> CuResult = cast(sym(c"cuCtxPushCurrent_v2"))?;
+        let pop: unsafe extern "system" fn(*mut CuContext) -> CuResult = cast(sym(c"cuCtxPopCurrent_v2"))?;
+        let event_create: unsafe extern "system" fn(*mut CuEvent, u32) -> CuResult = cast(sym(c"cuEventCreate"))?;
+        let event_record = cast(sym(c"cuEventRecord"))?;
+        let event_sync = cast(sym(c"cuEventSynchronize"))?;
+        let host_alloc = cast(sym(c"cuMemHostAlloc"))?;
+        let host_free = cast(sym(c"cuMemFreeHost"))?;
+        let memcpy2d_async = cast(sym(c"cuMemcpy2DAsync_v2"))?;
+        let import_ext_mem = cast(sym(c"cuImportExternalMemory"))?;
+        let ext_mem_buffer = cast(sym(c"cuExternalMemoryGetMappedBuffer"))?;
+        let destroy_ext_mem = cast(sym(c"cuDestroyExternalMemory"))?;
+        let mem_free = cast(sym(c"cuMemFree_v2"))?;
 
         let check = |r: CuResult, what: &str| if r == 0 { Ok(()) } else { Err(anyhow!("{what} failed (CUDA error {r})")) };
         check(init(0), "cuInit")?;
@@ -248,18 +292,59 @@ impl Default for CudaMemcpy2d {
 }
 
 type CuExtMem = *mut c_void;
+#[cfg(windows)]
 const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32: u32 = 2;
+#[cfg(target_os = "linux")]
+const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: u32 = 1;
 const CUDA_EXTERNAL_MEMORY_DEDICATED: u32 = 1;
 
-/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` from cuda.h (the handle union is 16 bytes).
+/// An exported memory handle: an opaque Win32 handle (the caller keeps ownership and closes it)
+/// or an opaque POSIX fd (CUDA takes ownership when the import succeeds).
+#[cfg(windows)]
+pub type ExtMemHandle = *mut c_void;
+#[cfg(target_os = "linux")]
+pub type ExtMemHandle = i32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Win32Handle {
+    handle: *mut c_void,
+    name: *const c_void,
+}
+
+/// The handle union of `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` (16 bytes, 8-byte aligned).
+#[repr(C)]
+union ExtMemHandleUnion {
+    fd: i32,
+    win32: Win32Handle,
+}
+
+/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` from cuda.h.
 #[repr(C)]
 struct ExtMemHandleDesc {
     handle_type: u32,
-    win32_handle: *mut c_void,
-    win32_name: *const c_void,
+    handle: ExtMemHandleUnion,
     size: u64,
     flags: u32,
     reserved: [u32; 16],
+}
+
+impl ExtMemHandleDesc {
+    fn new(handle: ExtMemHandle, size: u64) -> Self {
+        #[cfg(windows)]
+        let (handle_type, handle) = (
+            CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32,
+            ExtMemHandleUnion { win32: Win32Handle { handle, name: std::ptr::null() } },
+        );
+        #[cfg(target_os = "linux")]
+        let (handle_type, handle) = {
+            // Zero the whole union first so the bytes after the fd are defined.
+            let mut u = ExtMemHandleUnion { win32: Win32Handle { handle: std::ptr::null_mut(), name: std::ptr::null() } };
+            u.fd = handle;
+            (CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD, u)
+        };
+        Self { handle_type, handle, size, flags: CUDA_EXTERNAL_MEMORY_DEDICATED, reserved: [0; 16] }
+    }
 }
 
 /// `CUDA_EXTERNAL_MEMORY_BUFFER_DESC` from cuda.h.
@@ -318,23 +403,17 @@ impl PreviewTarget {
         chroma != Chroma::S444
     }
 
-    /// Imports `memory_size` bytes of exported Vulkan memory (an opaque Win32 handle; the
-    /// caller still owns and closes it) for `PREVIEW_SLOTS` slots of this frame shape.
-    pub fn import(handle: *mut c_void, memory_size: u64, width: u32, height: u32, chroma: Chroma) -> Result<Self> {
+    /// Imports `memory_size` bytes of exported Vulkan memory for `PREVIEW_SLOTS` slots of this
+    /// frame shape. Windows: the caller still owns and closes the handle. Linux: CUDA owns the fd
+    /// once the import succeeds; on an error the caller still owns (and closes) it.
+    pub fn import(handle: ExtMemHandle, memory_size: u64, width: u32, height: u32, chroma: Chroma) -> Result<Self> {
         let d = driver()?;
         let (y_pitch, uv_pitch, slot_size) = Self::layout(width, height, chroma);
         let size = (slot_size * PREVIEW_SLOTS) as u64;
         if size > memory_size {
             bail!("preview memory too small ({memory_size} < {size})");
         }
-        let desc = ExtMemHandleDesc {
-            handle_type: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32,
-            win32_handle: handle,
-            win32_name: std::ptr::null(),
-            size: memory_size,
-            flags: CUDA_EXTERNAL_MEMORY_DEDICATED,
-            reserved: [0; 16],
-        };
+        let desc = ExtMemHandleDesc::new(handle, memory_size);
         let mut ext_mem = std::ptr::null_mut();
         d.with_ctx("cuImportExternalMemory", || unsafe { (d.import_ext_mem)(&mut ext_mem, &desc) })?;
         let buf = ExtMemBufferDesc { offset: 0, size, flags: 0, reserved: [0; 16] };
@@ -635,7 +714,7 @@ impl Drop for GpuFrame {
 /// from a CUDA frame as from a CPU frame. Needs an NVIDIA GPU, no capture card.
 pub fn self_test(vfg_dir: Option<&std::path::Path>, range_only: bool) -> Result<()> {
     use crate::capture::FramePool;
-    use crate::capture::video_mf::{PixFmt, VideoMode};
+    use crate::capture::{PixFmt, VideoMode};
     use crate::config::Codec;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Instant;
@@ -848,6 +927,16 @@ pub fn self_test(vfg_dir: Option<&std::path::Path>, range_only: bool) -> Result<
 }
 
 /// CPU time used by this process so far (all threads), in ms.
+#[cfg(target_os = "linux")]
+pub fn process_cpu_ms() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts);
+    }
+    ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1_000_000.0
+}
+
+#[cfg(windows)]
 pub fn process_cpu_ms() -> f64 {
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};

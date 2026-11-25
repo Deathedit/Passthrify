@@ -339,13 +339,19 @@ struct Interop {
     memory: vk::DeviceMemory,
 }
 
+#[cfg(windows)]
+const EXT_MEMORY_EXT: &std::ffi::CStr = ash::khr::external_memory_win32::NAME;
+#[cfg(target_os = "linux")]
+const EXT_MEMORY_EXT: &std::ffi::CStr = ash::khr::external_memory_fd::NAME;
+
 impl Interop {
     fn shape(&self) -> (u32, u32, Chroma) {
         (self.target.width, self.target.height, self.target.chroma)
     }
 
     /// A buffer of `PREVIEW_SLOTS` frames in exportable device memory, imported into CUDA and
-    /// wrapped as a wgpu buffer. Needs wgpu on Vulkan with VK_KHR_external_memory_win32.
+    /// wrapped as a wgpu buffer. Needs wgpu on Vulkan with VK_KHR_external_memory_win32 (Windows)
+    /// or VK_KHR_external_memory_fd (Linux).
     fn create(device: &wgpu::Device, width: u32, height: u32, chroma: Chroma) -> anyhow::Result<Self> {
         use anyhow::{bail, Context};
         let (_, _, slot_size) = PreviewTarget::layout(width, height, chroma);
@@ -357,16 +363,19 @@ impl Interop {
                         d.raw_device().clone(),
                         d.raw_physical_device(),
                         d.shared_instance().raw_instance().clone(),
-                        d.enabled_device_extensions().contains(&ash::khr::external_memory_win32::NAME),
+                        d.enabled_device_extensions().contains(&EXT_MEMORY_EXT),
                     )
                 })
             })
         };
         let Some((dev, pdev, instance, has_ext)) = raw else { bail!("the preview isn't rendered with Vulkan") };
         if !has_ext {
-            bail!("VK_KHR_external_memory_win32 isn't available");
+            bail!("{} isn't available", EXT_MEMORY_EXT.to_string_lossy());
         }
+        #[cfg(windows)]
         let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
+        #[cfg(target_os = "linux")]
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
         unsafe {
             let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
             let info = vk::BufferCreateInfo::default()
@@ -404,13 +413,30 @@ impl Interop {
                 e
             };
             dev.bind_buffer_memory(buffer, memory, 0).map_err(|e| cleanup(anyhow::anyhow!("vkBindBufferMemory: {e}")))?;
-            let win32 = ash::khr::external_memory_win32::Device::new(&instance, &dev);
-            let handle = win32
-                .get_memory_win32_handle(&vk::MemoryGetWin32HandleInfoKHR::default().memory(memory).handle_type(handle_type))
-                .map_err(|e| cleanup(anyhow::anyhow!("vkGetMemoryWin32HandleKHR: {e}")))?;
-            // CUDA keeps its own reference; the handle itself is ours to close.
-            let target = PreviewTarget::import(handle as *mut std::ffi::c_void, req.size, width, height, chroma);
-            let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(handle as _));
+            #[cfg(windows)]
+            let target = {
+                let win32 = ash::khr::external_memory_win32::Device::new(&instance, &dev);
+                let handle = win32
+                    .get_memory_win32_handle(&vk::MemoryGetWin32HandleInfoKHR::default().memory(memory).handle_type(handle_type))
+                    .map_err(|e| cleanup(anyhow::anyhow!("vkGetMemoryWin32HandleKHR: {e}")))?;
+                // CUDA keeps its own reference; the handle itself is ours to close.
+                let target = PreviewTarget::import(handle as *mut std::ffi::c_void, req.size, width, height, chroma);
+                let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(handle as _));
+                target
+            };
+            #[cfg(target_os = "linux")]
+            let target = {
+                let fd_ext = ash::khr::external_memory_fd::Device::new(&instance, &dev);
+                let fd = fd_ext
+                    .get_memory_fd(&vk::MemoryGetFdInfoKHR::default().memory(memory).handle_type(handle_type))
+                    .map_err(|e| cleanup(anyhow::anyhow!("vkGetMemoryFdKHR: {e}")))?;
+                // A successful import hands the fd to CUDA; on failure it's still ours.
+                let target = PreviewTarget::import(fd, req.size, width, height, chroma);
+                if target.is_err() {
+                    libc::close(fd);
+                }
+                target
+            };
             let target = target.map_err(cleanup)?;
             let buffer = device.create_buffer_from_hal::<hal::api::Vulkan>(
                 hal::vulkan::Device::buffer_from_raw(buffer),

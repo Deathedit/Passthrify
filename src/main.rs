@@ -159,12 +159,18 @@ fn run_gui() -> Result<()> {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("Passthrify")
+            // Wayland matches the window to passthrify.desktop (its icon) through the app id.
+            .with_app_id("passthrify")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([480.0, 300.0])
+            // Linux: egui draws the title bar and border (ui/frame_linux.rs). Windows removes
+            // the native caption itself (ui/frame.rs) and keeps the frame's shadow and snapping.
+            .with_decorations(cfg!(windows))
             .with_icon(Arc::new(egui::IconData { rgba: tray::app_icon_rgba(128), width: 128, height: 128 })),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             present_mode,
             desired_maximum_frame_latency: Some(1),
+            wgpu_setup: wgpu_setup(),
             ..Default::default()
         },
         ..Default::default()
@@ -175,6 +181,16 @@ fn run_gui() -> Result<()> {
         Box::new(move |cc| Ok(Box::new(ui::app::App::new(cc, cfg, shared, pipeline)))),
     )
     .map_err(|e| anyhow!("UI error: {e}"))
+}
+
+/// Linux: Vulkan only (not GL), as the preview shares its frame buffer with CUDA through
+/// Vulkan. `WGPU_BACKEND` still overrides it. Windows keeps wgpu's default choice.
+fn wgpu_setup() -> egui_wgpu::WgpuSetup {
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::default();
+    if cfg!(target_os = "linux") && std::env::var_os("WGPU_BACKEND").is_none() {
+        setup.instance_descriptor.backends = wgpu::Backends::VULKAN;
+    }
+    egui_wgpu::WgpuSetup::CreateNew(setup)
 }
 
 fn init_logging(to_stderr: bool, file_name: &str) {
@@ -205,7 +221,12 @@ fn install_panic_hook() {
     }));
 }
 
+/// Linux programs always have their terminal; nothing to attach.
+#[cfg(not(windows))]
+fn attach_console() {}
+
 /// Lets a GUI-subsystem build print to the terminal it was started from.
+#[cfg(windows)]
 fn attach_console() {
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     unsafe {
@@ -214,15 +235,14 @@ fn attach_console() {
 }
 
 fn list_devices() -> Result<()> {
-    let _com = capture::ComGuard::new()?;
-    let _mf = capture::video_mf::MfGuard::new()?;
+    use capture::audio_dev::{self, Flow};
     println!("Video capture devices:");
-    for d in capture::video_mf::list_devices()? {
-        println!("  {}", d.name);
-        match capture::video_mf::VideoDevice::open(Some(&d.name)) {
-            Ok(dev) => {
-                let best = dev.choose_mode(None, config::Chroma::S420).map(|(m, _)| m);
-                for m in &dev.modes {
+    for (name, modes) in capture::describe_devices()? {
+        println!("  {name}");
+        match modes {
+            Ok(modes) => {
+                let best = capture::modes::choose_mode(&modes, None, config::Chroma::S420).map(|(m, _)| m);
+                for m in &modes {
                     let mark = if Some(*m) == best { "  <- default" } else { "" };
                     let chroma = if m.format.supported() { m.format.native_chroma().label() } else { "-" };
                     println!("      [{:>3}] {m} ({chroma}){mark}", m.index);
@@ -231,17 +251,10 @@ fn list_devices() -> Result<()> {
             Err(e) => println!("      (can't open: {e:#})"),
         }
     }
-    for (title, flow) in [
-        ("Audio inputs", capture::audio_wasapi::Flow::Capture),
-        ("Audio outputs", capture::audio_wasapi::Flow::Render),
-    ] {
+    for (title, flow) in [("Audio inputs", Flow::Capture), ("Audio outputs", Flow::Render)] {
         println!("{title}:");
-        for n in capture::audio_wasapi::list_endpoints(flow)? {
-            let mark = if flow == capture::audio_wasapi::Flow::Capture && capture::looks_like_elgato(&n) {
-                "  <- auto"
-            } else {
-                ""
-            };
+        for n in audio_dev::list_endpoints(flow)? {
+            let mark = if flow == Flow::Capture && capture::looks_like_elgato(&n) { "  <- auto" } else { "" };
             println!("  {n}{mark}");
         }
     }

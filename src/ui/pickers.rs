@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::capture::video_mf::VideoMode;
+use crate::capture::VideoMode;
 use crate::config::{Chroma, Codec, ModePref};
 
 fn fps_key(f: f64) -> u32 {
@@ -220,7 +220,7 @@ pub fn chroma_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::video_mf::PixFmt;
+    use crate::capture::PixFmt;
 
     fn m(w: u32, h: u32, num: u32, den: u32, format: PixFmt) -> VideoMode {
         VideoMode { index: 0, width: w, height: h, fps_num: num, fps_den: den, format }

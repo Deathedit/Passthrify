@@ -131,9 +131,11 @@ pub fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Ve
 }
 
 pub fn agent() -> Result<ureq::Agent> {
-    let tls = native_tls::TlsConnector::new().context("initializing TLS")?;
-    Ok(ureq::AgentBuilder::new()
-        .tls_connector(Arc::new(tls))
+    let builder = ureq::AgentBuilder::new();
+    // Windows: the system's TLS (Schannel). Linux: rustls, so no OpenSSL version to match.
+    #[cfg(windows)]
+    let builder = builder.tls_connector(Arc::new(native_tls::TlsConnector::new().context("initializing TLS")?));
+    Ok(builder
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .user_agent(&format!("Passthrify/{} (+updater)", env!("CARGO_PKG_VERSION")))
@@ -250,6 +252,9 @@ pub fn install_blocker() -> Option<String> {
     if cfg!(debug_assertions) {
         return Some("Development build: install releases from GitHub instead.".into());
     }
+    if cfg!(target_os = "linux") {
+        return Some("Updating from inside the app isn't available on Linux yet.".into());
+    }
     let dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
         Some(d) => d,
         None => return Some("Can't determine the install folder.".into()),
@@ -301,6 +306,15 @@ pub fn take_update_result() -> Option<(bool, String)> {
     Some((status.trim() == "ok", msg.trim().to_string()))
 }
 
+#[cfg(target_os = "linux")]
+fn wait_for_exit(pid: u32, timeout: Duration) {
+    let started = std::time::Instant::now();
+    while Path::new(&format!("/proc/{pid}")).exists() && started.elapsed() < timeout {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
 fn wait_for_exit(pid: u32, timeout: Duration) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
@@ -345,6 +359,10 @@ fn copy_tree(from: &Path, to: &Path) -> Result<usize> {
 
 /// If Passthrify was installed with the setup (installer/passthrify.iss, per-user), keeps its
 /// Apps & features entry at the version just installed in place. A no-op for zip installs.
+#[cfg(not(windows))]
+fn set_installed_version(_version: &str) {}
+
+#[cfg(windows)]
 fn set_installed_version(version: &str) {
     use windows::core::w;
     use windows::Win32::Foundation::ERROR_SUCCESS;

@@ -76,6 +76,9 @@ features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 libc = "0.2"
+# Capture: V4L2 video, PipeWire audio.
+v4l = "0.14"
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 
 [build-dependencies]
 # Render assets/logo/passthrify-mark.svg into a multi-size .ico and embed it in the exe.

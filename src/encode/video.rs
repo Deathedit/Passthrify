@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Receiver;
 use ffmpeg_next as ff;
 
-use crate::capture::video_mf::VideoMode;
+use crate::capture::VideoMode;
 use crate::capture::VideoFrame;
 use crate::color::{ColorInfo, Matrix};
 use crate::config::{Chroma, Codec};
@@ -317,7 +317,7 @@ fn drain(enc: &mut ff::encoder::Video, pkt: &mut ff::Packet, sink: &mut impl FnM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::video_mf::PixFmt;
+    use crate::capture::PixFmt;
 
     fn mode(w: u32, h: u32, fps: u32) -> VideoMode {
         VideoMode { index: 0, width: w, height: h, fps_num: fps, fps_den: 1, format: PixFmt::Nv12 }

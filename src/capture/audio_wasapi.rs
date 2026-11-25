@@ -16,7 +16,7 @@ use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use super::{AUDIO_CHANNELS, AUDIO_RATE};
+use super::{sleep_unless_stopped, AUDIO_CHANNELS, AUDIO_RATE};
 use crate::audio::PassRing;
 use crate::clock;
 
@@ -250,13 +250,5 @@ pub fn run_render(pref: Option<String>, stop: Arc<AtomicBool>, ring: Arc<PassRin
                 sleep_unless_stopped(&stop, 3000);
             }
         }
-    }
-}
-
-fn sleep_unless_stopped(stop: &AtomicBool, ms: u64) {
-    let mut left = ms;
-    while left > 0 && !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(left.min(100)));
-        left = left.saturating_sub(100);
     }
 }

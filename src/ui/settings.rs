@@ -10,7 +10,7 @@ use eframe::egui::{self, FontId, Margin, RichText, Stroke, Vec2};
 use super::app::{hotkey_parts, pretty_hotkey};
 use super::pickers;
 use super::theme::{self, icons, Kind};
-use crate::capture::video_mf::VideoMode;
+use crate::capture::VideoMode;
 use crate::color::{ColorInfo, RangePref};
 use crate::config::{Chroma, Codec, Config, PresentMode, StreamService};
 use crate::updater::{self, UpdateChannel, UpdateState, Updater};

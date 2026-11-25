@@ -1,5 +1,6 @@
-//! Copies the FFmpeg runtime DLLs next to the built executable (target/<profile>), so the exe
-//! runs when launched directly, not only via `cargo run`.
+//! Windows: embeds the icon and copies the FFmpeg runtime DLLs next to the built executable
+//! (target/<profile>), so the exe runs when launched directly, not only via `cargo run`.
+//! Linux: sets an `$ORIGIN/lib` rpath for bundled builds (PASSTHRIFY_BUNDLE_LIBS).
 
 use std::{env, fs, path::PathBuf};
 
@@ -49,6 +50,16 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/svg_raster.rs");
     embed_icon();
+
+    // Linux tarball / AppImage: the binary finds the bundled FFmpeg in lib/ next to it.
+    println!("cargo:rerun-if-env-changed=PASSTHRIFY_BUNDLE_LIBS");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        if env::var_os("PASSTHRIFY_BUNDLE_LIBS").is_some() {
+            println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/lib");
+        }
+        // The DLL copy below is for Windows; Linux links against FFMPEG_DIR/lib (or pkg-config).
+        return;
+    }
 
     let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") else {
         println!("cargo:warning=FFMPEG_DIR not set; FFmpeg DLLs will not be copied");

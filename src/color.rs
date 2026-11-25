@@ -71,6 +71,7 @@ impl ColorInfo {
     /// From Media Foundation attributes: MF_MT_VIDEO_NOMINAL_RANGE (1 = 0-255, 2 = 16-235) and
     /// MF_MT_YUV_MATRIX (1 = BT.709, 2 = BT.601). Missing values default to limited, and to
     /// BT.709 for HD / BT.601 for SD.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_mf(nominal_range: Option<u32>, yuv_matrix: Option<u32>, height: u32) -> Self {
         let matrix = match yuv_matrix {
             Some(2) => Matrix::Bt601,
@@ -79,6 +80,28 @@ impl ColorInfo {
             _ => Matrix::Bt709,
         };
         Self { full_range: nominal_range == Some(1), matrix }
+    }
+
+    /// From a V4L2 pixel format: `colorspace` (1 = SMPTE 170M, 3 = Rec. 709, 7 = JPEG,
+    /// 8 = sRGB), `ycbcr_enc` (1 = BT.601, 2 = BT.709, 3/4 = their xvYCC variants, 0 = derive
+    /// from the colorspace) and `quantization` (1 = full, 2 = limited, 0 = derive: full only for
+    /// the JPEG colorspace), as the V4L2 spec defines the defaults.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn from_v4l2(colorspace: u32, ycbcr_enc: u32, quantization: u32, height: u32) -> Self {
+        let matrix = match (ycbcr_enc, colorspace) {
+            (1 | 3, _) => Matrix::Bt601,
+            (2 | 4, _) => Matrix::Bt709,
+            (_, 3) => Matrix::Bt709,
+            (_, 1 | 7 | 8) => Matrix::Bt601,
+            _ if height < 720 => Matrix::Bt601,
+            _ => Matrix::Bt709,
+        };
+        let full_range = match quantization {
+            1 => true,
+            2 => false,
+            _ => colorspace == 7,
+        };
+        Self { full_range, matrix }
     }
 
     pub fn with_range(mut self, pref: RangePref) -> Self {

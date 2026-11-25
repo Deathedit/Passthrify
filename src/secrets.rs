@@ -1,10 +1,6 @@
-//! Stream keys in Windows Credential Manager (one per service), so they never land in
-//! config.toml. Visible under Control Panel › Credential Manager › Windows Credentials.
-
-use windows::core::{HSTRING, PWSTR};
-use windows::Win32::Security::Credentials::{
-    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
-};
+//! Stream keys in the system's credential store (one per service), so they never land in
+//! config.toml. Windows: Credential Manager (Control Panel › Credential Manager › Windows
+//! Credentials).
 
 use crate::config::StreamService;
 
@@ -22,6 +18,25 @@ pub fn set_stream_key(service: StreamService, key: &str) -> anyhow::Result<()> {
     write(&target(service), key)
 }
 
+#[cfg(target_os = "linux")]
+fn read(_name: &str) -> Option<String> {
+    None
+}
+
+/// Linux: not wired up yet (Phase 2: Secret Service).
+#[cfg(target_os = "linux")]
+fn write(_name: &str, _key: &str) -> anyhow::Result<()> {
+    anyhow::bail!("saving stream keys isn't available on Linux yet")
+}
+
+#[cfg(windows)]
+use windows::core::{HSTRING, PWSTR};
+#[cfg(windows)]
+use windows::Win32::Security::Credentials::{
+    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+};
+
+#[cfg(windows)]
 fn read(name: &str) -> Option<String> {
     unsafe {
         let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
@@ -34,6 +49,7 @@ fn read(name: &str) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
 fn write(name: &str, key: &str) -> anyhow::Result<()> {
     let key = key.trim();
     let name = HSTRING::from(name);
@@ -57,7 +73,7 @@ fn write(name: &str, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

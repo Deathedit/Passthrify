@@ -18,8 +18,8 @@ use crossbeam_channel::{bounded, never, select, unbounded, Receiver, Sender, Try
 use parking_lot::Mutex;
 
 use crate::audio::PassRing;
-use crate::capture::video_mf::{self, VideoMode};
-use crate::capture::{audio_wasapi, AudioChunk, VideoFrame};
+use crate::capture::{audio_dev, video, VideoMode};
+use crate::capture::{AudioChunk, VideoFrame};
 use crate::color::ColorInfo;
 use crate::config::{Chroma, Codec, Config};
 use crate::encode;
@@ -339,7 +339,7 @@ impl Session {
                 let mut scratch = Vec::new();
                 let mut upload_failed = false;
                 let stream_frames = stream_frames.clone();
-                video_mf::run_capture(
+                video::run_capture(
                     device,
                     pref,
                     chroma,
@@ -426,7 +426,7 @@ impl Session {
             let (pref, video_device, passthrough) =
                 (cfg.audio_input.clone(), cfg.video_device.clone(), cfg.passthrough_enabled);
             threads.push(spawn("audio-capture", move || {
-                audio_wasapi::run_capture(
+                audio_dev::run_capture(
                     pref,
                     video_device,
                     stop,
@@ -452,7 +452,7 @@ impl Session {
         // Audio passthrough render.
         if cfg.passthrough_enabled {
             let (stop, ring, out) = (stop.clone(), shared.ring.clone(), cfg.audio_output.clone());
-            threads.push(spawn("audio-render", move || audio_wasapi::run_render(out, stop, ring)));
+            threads.push(spawn("audio-render", move || audio_dev::run_render(out, stop, ring)));
         }
 
         let bus = Arc::new(PacketBus::new(cfg.replay_seconds, cfg.replay_enabled));

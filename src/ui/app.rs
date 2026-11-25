@@ -749,10 +749,14 @@ impl App {
     /// minimize / maximize / close on the right.
     fn title_bar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.allocate_rect(rect, egui::Sense::hover());
         let ctx = ui.ctx().clone();
         let (focused, maximized) =
             ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().maximized.unwrap_or(false)));
+        // Windows: the window procedure makes this area drag the window. Linux: egui does.
+        #[cfg(windows)]
+        ui.allocate_rect(rect, egui::Sense::hover());
+        #[cfg(target_os = "linux")]
+        super::frame::title_bar(&ui.allocate_rect(rect, egui::Sense::click_and_drag()), maximized);
         let p = ui.painter();
         p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, theme::DIVIDER));
         let cy = rect.center().y;
@@ -1195,6 +1199,8 @@ impl eframe::App for App {
 
         // Our 1 px window border (the native one is gone); none when maximized or fullscreen.
         if !self.fullscreen && !maximized {
+            #[cfg(target_os = "linux")]
+            super::frame::resize_edges(ctx);
             ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))).rect_stroke(
                 ctx.screen_rect(),
                 0,
