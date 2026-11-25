@@ -178,6 +178,25 @@ fn main() -> Result<()> {
     run_gui()
 }
 
+/// What to do when the swapchain can't hand out an image.
+///
+/// egui's default skips the frame on `Outdated` without rebuilding the swapchain (on Windows
+/// that's a minimized window, fixed by the resize on restore). On Wayland the swapchain can go
+/// out of date while the window keeps its size (around the compositor's first configures), and
+/// then every frame was skipped silently: the window froze on its first frame until a resize.
+fn surface_error_policy() -> Arc<dyn Fn(wgpu::SurfaceError) -> egui_wgpu::SurfaceErrorAction + Send + Sync> {
+    if cfg!(windows) {
+        return egui_wgpu::WgpuConfiguration::default().on_surface_error;
+    }
+    Arc::new(|err| match err {
+        wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost => egui_wgpu::SurfaceErrorAction::RecreateSurface,
+        other => {
+            tracing::warn!("dropped a frame: {other}");
+            egui_wgpu::SurfaceErrorAction::SkipFrame
+        }
+    })
+}
+
 fn run_gui() -> Result<()> {
     let cfg = Config::load();
     let shared = Arc::new(Shared::new(&cfg));
@@ -205,6 +224,7 @@ fn run_gui() -> Result<()> {
             present_mode,
             desired_maximum_frame_latency: Some(1),
             wgpu_setup: wgpu_setup(),
+            on_surface_error: surface_error_policy(),
             ..Default::default()
         },
         ..Default::default()
