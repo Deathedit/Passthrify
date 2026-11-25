@@ -198,6 +198,9 @@ Needs Rust stable, a C toolchain, clang/libclang, pkg-config and the PipeWire de
 ./build.sh --skip-tests          # no cargo test
 ```
 
+`build.sh` finds libclang itself. For plain `cargo build`, set `LIBCLANG_PATH` (for example
+`/usr/lib/llvm-18/lib`): `.cargo/config.toml` otherwise points it at the Windows LLVM folder.
+
 On NixOS, `nix develop` gives a shell with everything (FFmpeg from nixpkgs), so
 `cargo run` works directly, and `nix build` builds the flake package. `nix develop -c
 ./build.sh` also works, but its packages only run on NixOS; portable ones come from CI on

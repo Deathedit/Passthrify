@@ -69,6 +69,21 @@ export FFMPEG_DIR="$FFMPEG_DIR_LOCAL"
 export PKG_CONFIG_PATH="$FFMPEG_DIR_LOCAL/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export PASSTHRIFY_BUNDLE_LIBS=1
 
+# bindgen needs libclang. .cargo/config.toml points LIBCLANG_PATH at the Windows LLVM folder
+# unless it's already set, so find the system one (the Nix shell sets its own).
+if [ ! -d "${LIBCLANG_PATH:-}" ]; then
+    LIBCLANG_PATH=""
+    for d in "$(llvm-config --libdir 2>/dev/null || true)" /usr/lib/llvm-*/lib /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib; do
+        if [ -n "$d" ] && compgen -G "$d/libclang*.so*" >/dev/null; then
+            LIBCLANG_PATH="$d"
+            break
+        fi
+    done
+    [ -n "$LIBCLANG_PATH" ] || fail "libclang not found (Debian/Ubuntu: libclang-dev); or set LIBCLANG_PATH"
+    export LIBCLANG_PATH
+fi
+echo "  libclang: $LIBCLANG_PATH"
+
 # --- Build --------------------------------------------------------------------------------
 
 if [ "$CLEAN" = 1 ]; then
