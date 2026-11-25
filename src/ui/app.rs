@@ -210,7 +210,11 @@ impl App {
         for e in &hotkey_errors {
             shared.notify(format!("Hotkey problem: {e}"), true);
         }
-        let tray = match tray::create(hwnd, pipeline.sender()) {
+        #[cfg(windows)]
+        let tray = tray::create(hwnd, pipeline.sender());
+        #[cfg(target_os = "linux")]
+        let tray = tray::create(&cc.egui_ctx, pipeline.sender());
+        let tray = match tray {
             Ok(t) => Some(t),
             Err(e) => {
                 tracing::warn!("tray icon unavailable: {e:#}");
