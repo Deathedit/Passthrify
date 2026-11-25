@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=Passthrify
+GenericName=Capture Card Viewer
+Comment=Low-latency capture card viewer with instant replay, recording and streaming
+Exec=passthrify
+Icon=passthrify
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=capture;elgato;replay;record;stream;
+StartupWMClass=passthrify
+Actions=SaveReplay;ToggleRecord;Screenshot;
+
+[Desktop Action SaveReplay]
+Name=Save instant replay
+Exec=passthrify --action save-replay
+
+[Desktop Action ToggleRecord]
+Name=Start / stop recording
+Exec=passthrify --action toggle-record
+
+[Desktop Action Screenshot]
+Name=Screenshot
+Exec=passthrify --action screenshot
