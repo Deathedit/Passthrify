@@ -7,7 +7,13 @@
 //! 3. `launch_installer`: run the *new* exe from the temp folder with `--apply-update`; it
 //!    waits for this process to exit, copies itself over the install folder and relaunches.
 //!    No separate updater binary, and nothing ever overwrites a running exe.
+//!
+//! Linux ([`InstallKind`]): the release tarball (`Passthrify-<ver>-linux-x86_64.tar.gz`)
+//! goes through the same staged flow; an AppImage (`Passthrify-<ver>-x86_64.AppImage`) is
+//! downloaded next to itself, renamed over `$APPIMAGE` and relaunched; a Nix install is
+//! updated through its flake, not from inside the app.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +44,49 @@ impl UpdateChannel {
         match self {
             UpdateChannel::Stable => "Stable",
             UpdateChannel::PreRelease => "Pre-release",
+        }
+    }
+}
+
+/// The app's executable inside an install folder or package.
+pub const EXE: &str = if cfg!(windows) { "passthrify.exe" } else { "passthrify" };
+
+/// How this copy was installed, which decides the release asset and how it's replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallKind {
+    /// Windows: the zip (or the setup, which installs the same files).
+    Zip,
+    /// Linux: the release tarball, unpacked anywhere writable.
+    Tarball,
+    /// Linux: the single-file AppImage (`$APPIMAGE`).
+    AppImage,
+    /// Linux: the Nix flake package (read-only store path).
+    Nix,
+}
+
+impl InstallKind {
+    pub fn current() -> Self {
+        Self::detect(std::env::current_exe().ok().as_deref(), std::env::var_os("APPIMAGE").as_deref())
+    }
+
+    fn detect(exe: Option<&Path>, appimage: Option<&OsStr>) -> Self {
+        if cfg!(windows) {
+            InstallKind::Zip
+        } else if appimage.is_some_and(|a| !a.is_empty()) {
+            InstallKind::AppImage
+        } else if exe.is_some_and(|e| e.starts_with("/nix/store")) {
+            InstallKind::Nix
+        } else {
+            InstallKind::Tarball
+        }
+    }
+
+    /// The release asset for version `ver` (its checksum is the same name + `.sha256`).
+    pub fn package_name(self, ver: &str) -> String {
+        match self {
+            InstallKind::Zip => format!("Passthrify-{ver}.zip"),
+            InstallKind::Tarball | InstallKind::Nix => format!("Passthrify-{ver}-linux-x86_64.tar.gz"),
+            InstallKind::AppImage => format!("Passthrify-{ver}-x86_64.AppImage"),
         }
     }
 }
@@ -88,9 +137,10 @@ pub struct Release {
     pub notes: String,
     pub url: String,
     pub prerelease: bool,
-    pub zip_name: String,
-    pub zip_url: String,
-    pub zip_size: u64,
+    pub kind: InstallKind,
+    pub package_name: String,
+    pub package_url: String,
+    pub package_size: u64,
     pub sha_url: String,
 }
 
@@ -98,9 +148,13 @@ fn version_of(tag: &str) -> Option<Version> {
     Version::parse(tag.trim().trim_start_matches(['v', 'V'])).ok()
 }
 
-/// Newest release allowed by `channel` that is newer than `current` and ships the zip +
-/// checksum assets. Releases without those assets are skipped (e.g. a botched upload).
+/// Newest release allowed by `channel` that is newer than `current` and ships this install's
+/// package + checksum assets. Releases without them are skipped (e.g. a botched upload).
 pub fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Version) -> Option<Release> {
+    pick_release_for(releases, channel, current, InstallKind::current())
+}
+
+fn pick_release_for(releases: &[GhRelease], channel: UpdateChannel, current: &Version, kind: InstallKind) -> Option<Release> {
     releases
         .iter()
         .filter(|r| !r.draft)
@@ -111,9 +165,9 @@ pub fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Ve
         })
         .filter(|(v, _)| v > current)
         .filter_map(|(v, r)| {
-            let zip_name = format!("Passthrify-{}.zip", r.tag_name.trim_start_matches(['v', 'V']));
-            let zip = r.assets.iter().find(|a| a.name == zip_name)?;
-            let sha = r.assets.iter().find(|a| a.name == format!("{zip_name}.sha256"))?;
+            let package_name = kind.package_name(r.tag_name.trim_start_matches(['v', 'V']));
+            let package = r.assets.iter().find(|a| a.name == package_name)?;
+            let sha = r.assets.iter().find(|a| a.name == format!("{package_name}.sha256"))?;
             let prerelease = r.prerelease || !v.pre.is_empty();
             Some(Release {
                 version: v,
@@ -121,9 +175,10 @@ pub fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Ve
                 notes: r.body.clone().unwrap_or_default(),
                 url: r.html_url.clone(),
                 prerelease,
-                zip_name,
-                zip_url: zip.browser_download_url.clone(),
-                zip_size: zip.size,
+                kind,
+                package_name,
+                package_url: package.browser_download_url.clone(),
+                package_size: package.size,
                 sha_url: sha.browser_download_url.clone(),
             })
         })
@@ -131,9 +186,11 @@ pub fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Ve
 }
 
 pub fn agent() -> Result<ureq::Agent> {
-    let tls = native_tls::TlsConnector::new().context("initializing TLS")?;
-    Ok(ureq::AgentBuilder::new()
-        .tls_connector(Arc::new(tls))
+    let builder = ureq::AgentBuilder::new();
+    // Windows: the system's TLS (Schannel). Linux: rustls, so no OpenSSL version to match.
+    #[cfg(windows)]
+    let builder = builder.tls_connector(Arc::new(native_tls::TlsConnector::new().context("initializing TLS")?));
+    Ok(builder
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .user_agent(&format!("Passthrify/{} (+updater)", env!("CARGO_PKG_VERSION")))
@@ -171,19 +228,19 @@ fn parse_sha256(text: &str) -> Result<String> {
     Ok(hash)
 }
 
-/// Finds the folder holding passthrify.exe: the extraction root or its single subfolder
-/// (the release zip contains a top-level `Passthrify/` folder).
+/// Finds the folder holding the exe: the extraction root or its single subfolder (the release
+/// archives contain a top-level `Passthrify/` folder).
 fn find_app_dir(root: &Path) -> Result<PathBuf> {
-    if root.join("passthrify.exe").is_file() {
+    if root.join(EXE).is_file() {
         return Ok(root.to_path_buf());
     }
     for entry in std::fs::read_dir(root)?.flatten() {
         let p = entry.path();
-        if p.is_dir() && p.join("passthrify.exe").is_file() {
+        if p.is_dir() && p.join(EXE).is_file() {
             return Ok(p);
         }
     }
-    bail!("update package doesn't contain passthrify.exe")
+    bail!("update package doesn't contain {EXE}")
 }
 
 /// Downloads `url` to `dest`, checking it against the "<sha256>  name" file at `sha_url`.
@@ -226,23 +283,64 @@ pub fn download_verified(
     Ok(())
 }
 
-/// Downloads, verifies and extracts `rel`. Returns the folder containing the new exe.
+/// Downloads, verifies and extracts `rel`. Returns the folder containing the new exe, or for
+/// an AppImage the downloaded file (next to the running one, ready to rename over it).
 pub fn download_and_stage(rel: &Release, progress: impl Fn(f32)) -> Result<PathBuf> {
     let agent = agent()?;
+    if rel.kind == InstallKind::AppImage {
+        let target = appimage_path()?;
+        let part = target.with_file_name(format!(".{}.part", rel.package_name));
+        if let Err(e) = download_verified(&agent, &rel.package_url, &rel.sha_url, rel.package_size, &part, progress) {
+            let _ = std::fs::remove_file(&part);
+            return Err(e.context("nothing was installed"));
+        }
+        return Ok(part);
+    }
+
     let dir = staging_root().join(rel.version.to_string());
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let zip_path = dir.join(&rel.zip_name);
-    if let Err(e) = download_verified(&agent, &rel.zip_url, &rel.sha_url, rel.zip_size, &zip_path, progress) {
+    let package = dir.join(&rel.package_name);
+    if let Err(e) = download_verified(&agent, &rel.package_url, &rel.sha_url, rel.package_size, &package, progress) {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e.context("nothing was installed"));
     }
 
     let extract = dir.join("extracted");
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path)?).context("opening update package")?;
-    archive.extract(&extract).context("extracting update package")?;
+    match rel.kind {
+        InstallKind::Zip => {
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(&package)?).context("opening update package")?;
+            archive.extract(&extract).context("extracting update package")?;
+        }
+        #[cfg(target_os = "linux")]
+        InstallKind::Tarball | InstallKind::Nix => {
+            // Keeps the files' modes, so the exe stays executable.
+            let gz = flate2::read::GzDecoder::new(std::fs::File::open(&package)?);
+            tar::Archive::new(gz).unpack(&extract).context("extracting update package")?;
+        }
+        other => bail!("can't unpack a {other:?} package here"),
+    }
     find_app_dir(&extract)
+}
+
+/// The running AppImage file.
+fn appimage_path() -> Result<PathBuf> {
+    std::env::var_os("APPIMAGE")
+        .filter(|a| !a.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("not running from an AppImage"))
+}
+
+/// Puts the verified download in place of the AppImage. The running copy keeps its (now
+/// unlinked) file, so replacing it underneath is safe; the rename is atomic.
+fn install_appimage(downloaded: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(downloaded, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(downloaded, target).with_context(|| format!("replacing {}", target.display()))
 }
 
 /// Why self-install isn't possible here, if it isn't.
@@ -250,9 +348,15 @@ pub fn install_blocker() -> Option<String> {
     if cfg!(debug_assertions) {
         return Some("Development build: install releases from GitHub instead.".into());
     }
-    let dir = match std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
-        Some(d) => d,
-        None => return Some("Can't determine the install folder.".into()),
+    let folder = match InstallKind::current() {
+        InstallKind::Nix => return Some("Installed with Nix: update your flake (nix flake update) instead.".into()),
+        InstallKind::AppImage => appimage_path().ok().and_then(|p| p.parent().map(Path::to_path_buf)),
+        InstallKind::Zip | InstallKind::Tarball => {
+            std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
+        }
+    };
+    let Some(dir) = folder else {
+        return Some("Can't determine the install folder.".into());
     };
     let probe = dir.join(".passthrify-write-test");
     match std::fs::File::create(&probe) {
@@ -264,13 +368,33 @@ pub fn install_blocker() -> Option<String> {
     }
 }
 
-/// Starts the staged exe as installer. The caller must then exit promptly.
-pub fn launch_installer(staged: &Path, version: &Version) -> Result<()> {
+/// Starts the staged exe as installer (AppImage: puts the new file in place and starts it).
+/// The caller must then exit promptly.
+pub fn launch_installer(staged: &Path, rel: &Release) -> Result<()> {
+    let version = &rel.version;
+    if rel.kind == InstallKind::AppImage {
+        let target = appimage_path()?;
+        if let Err(e) = install_appimage(staged, &target) {
+            let _ = std::fs::remove_file(staged);
+            return Err(e);
+        }
+        write_result("ok", &format!("Updated to Passthrify {version}"));
+        // The new copy waits for this one to exit; otherwise it would find this instance
+        // running (control.rs) and just bring it to the front.
+        std::process::Command::new(&target)
+            .arg("--wait-pid")
+            .arg(std::process::id().to_string())
+            .env_remove("APPDIR")
+            .env_remove("ARGV0")
+            .spawn()
+            .context("starting the new version")?;
+        return Ok(());
+    }
     let install_dir = std::env::current_exe()?
         .parent()
         .ok_or_else(|| anyhow!("no install folder"))?
         .to_path_buf();
-    std::process::Command::new(staged.join("passthrify.exe"))
+    std::process::Command::new(staged.join(EXE))
         .arg("--apply-update")
         .arg("--from")
         .arg(staged)
@@ -292,6 +416,12 @@ fn result_file() -> PathBuf {
     crate::config::Config::data_dir().join("update-result.txt")
 }
 
+/// Leaves the outcome for the relaunched app to show ([`take_update_result`]).
+fn write_result(status: &str, msg: &str) {
+    let _ = std::fs::create_dir_all(crate::config::Config::data_dir());
+    let _ = std::fs::write(result_file(), format!("{status}\n{msg}\n"));
+}
+
 /// After a restart: Some((ok, message)) describing the last update attempt, once.
 pub fn take_update_result() -> Option<(bool, String)> {
     let path = result_file();
@@ -301,7 +431,17 @@ pub fn take_update_result() -> Option<(bool, String)> {
     Some((status.trim() == "ok", msg.trim().to_string()))
 }
 
-fn wait_for_exit(pid: u32, timeout: Duration) {
+/// Waits (up to `timeout`) for process `pid` to end.
+#[cfg(target_os = "linux")]
+pub fn wait_for_exit(pid: u32, timeout: Duration) {
+    let started = std::time::Instant::now();
+    while Path::new(&format!("/proc/{pid}")).exists() && started.elapsed() < timeout {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+pub fn wait_for_exit(pid: u32, timeout: Duration) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
     unsafe {
@@ -326,8 +466,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<usize> {
         // Antivirus scanners or a slow exit can hold files briefly: retry for ~10 s.
         let mut attempt = 0;
         loop {
-            match std::fs::copy(&src, &dst) {
-                Ok(_) => break,
+            match replace_file(&src, &dst) {
+                Ok(()) => break,
                 Err(e) if attempt < 40 => {
                     attempt += 1;
                     if attempt == 1 {
@@ -343,8 +483,30 @@ fn copy_tree(from: &Path, to: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// Windows: copies over the file in place (the old process has exited).
+#[cfg(windows)]
+fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+/// Unix: copies next to it, then renames over it. Atomic, keeps the mode, and works even if
+/// something still runs the old binary (writing into it would fail with ETXTBSY).
+#[cfg(unix)]
+fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dst.with_file_name(format!(".{name}.update-tmp"));
+    std::fs::copy(src, &tmp)?;
+    std::fs::rename(&tmp, dst).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// If Passthrify was installed with the setup (installer/passthrify.iss, per-user), keeps its
 /// Apps & features entry at the version just installed in place. A no-op for zip installs.
+#[cfg(not(windows))]
+fn set_installed_version(_version: &str) {}
+
+#[cfg(windows)]
 fn set_installed_version(version: &str) {
     use windows::core::w;
     use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -392,11 +554,10 @@ pub fn apply_update_main(args: &[String]) -> Result<()> {
             ("error", format!("Update to {version} failed: {e:#}"))
         }
     };
-    let _ = std::fs::create_dir_all(crate::config::Config::data_dir());
-    let _ = std::fs::write(result_file(), format!("{status}\n{msg}\n"));
+    write_result(status, &msg);
 
     // Relaunch whatever is in the install folder now (new on success, old on failure).
-    std::process::Command::new(to.join("passthrify.exe"))
+    std::process::Command::new(to.join(EXE))
         .current_dir(&to)
         .spawn()
         .context("relaunching Passthrify")?;
@@ -486,7 +647,7 @@ impl Updater {
                     }
                     (me.repaint)();
                 });
-                let res = staged.and_then(|dir| launch_installer(&dir, &rel.version));
+                let res = staged.and_then(|dir| launch_installer(&dir, &rel));
                 match res {
                     Ok(()) => me.set(UpdateState::Restarting),
                     Err(e) => {
@@ -502,6 +663,11 @@ impl Updater {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Windows release picker (these tests run on every platform).
+    fn pick_release(releases: &[GhRelease], channel: UpdateChannel, current: &Version) -> Option<Release> {
+        pick_release_for(releases, channel, current, InstallKind::Zip)
+    }
 
     fn rel(tag: &str, prerelease: bool, with_assets: bool) -> GhRelease {
         let ver = tag.trim_start_matches('v');
@@ -544,7 +710,7 @@ mod tests {
         let pre = pick_release(&releases, UpdateChannel::PreRelease, &v("0.1.0")).unwrap();
         assert_eq!(pre.tag, "v0.3.0-beta.1");
         assert!(pre.prerelease);
-        assert_eq!(pre.zip_name, "Passthrify-0.3.0-beta.1.zip");
+        assert_eq!(pre.package_name, "Passthrify-0.3.0-beta.1.zip");
         assert_eq!(pre.sha_url, "https://x/0.3.0-beta.1.sha256");
     }
 
@@ -612,13 +778,42 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[test]
+    fn linux_packages_are_picked_by_install_kind() {
+        let mut r = rel("v0.4.0", false, true);
+        for name in ["Passthrify-0.4.0-linux-x86_64.tar.gz", "Passthrify-0.4.0-x86_64.AppImage"] {
+            r.assets.push(GhAsset { name: name.into(), browser_download_url: format!("https://x/{name}"), size: 5 });
+            r.assets.push(GhAsset { name: format!("{name}.sha256"), browser_download_url: format!("https://x/{name}.sha256"), size: 1 });
+        }
+        let releases = [r];
+        let pick = |kind| pick_release_for(&releases, UpdateChannel::Stable, &v("0.3.0"), kind).unwrap();
+        assert_eq!(pick(InstallKind::Zip).package_url, "https://x/0.4.0.zip");
+        let tar = pick(InstallKind::Tarball);
+        assert_eq!(tar.package_name, "Passthrify-0.4.0-linux-x86_64.tar.gz");
+        assert_eq!(tar.sha_url, "https://x/Passthrify-0.4.0-linux-x86_64.tar.gz.sha256");
+        assert_eq!(pick(InstallKind::AppImage).package_url, "https://x/Passthrify-0.4.0-x86_64.AppImage");
+        // A release without the Linux assets isn't offered to Linux installs.
+        let windows_only = [rel("v0.5.0", false, true)];
+        assert!(pick_release_for(&windows_only, UpdateChannel::Stable, &v("0.3.0"), InstallKind::Tarball).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detects_the_install_kind() {
+        let d = |exe: &str, appimage: Option<&str>| InstallKind::detect(Some(Path::new(exe)), appimage.map(OsStr::new));
+        assert_eq!(d("/home/me/Passthrify/passthrify", None), InstallKind::Tarball);
+        assert_eq!(d("/tmp/.mount_PassthXYZ/usr/bin/passthrify", Some("/home/me/Passthrify.AppImage")), InstallKind::AppImage);
+        assert_eq!(d("/nix/store/abc-passthrify-0.1.2/bin/.passthrify-wrapped", None), InstallKind::Nix);
+        assert_eq!(d("/home/me/Passthrify/passthrify", Some("")), InstallKind::Tarball);
+    }
+
     fn test_zip() -> Vec<u8> {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut z = zip::ZipWriter::new(&mut buf);
             let opts = zip::write::SimpleFileOptions::default();
             z.add_directory("Passthrify/", opts).unwrap();
-            z.start_file("Passthrify/passthrify.exe", opts).unwrap();
+            z.start_file(format!("Passthrify/{EXE}"), opts).unwrap();
             z.write_all(b"new exe").unwrap();
             z.start_file("Passthrify/avcodec-62.dll", opts).unwrap();
             z.write_all(&vec![7u8; 100_000]).unwrap();
@@ -634,9 +829,10 @@ mod tests {
             notes: String::new(),
             url: String::new(),
             prerelease: false,
-            zip_name: format!("Passthrify-{ver}.zip"),
-            zip_url: format!("{base}/pkg.zip"),
-            zip_size: 0,
+            kind: InstallKind::Zip,
+            package_name: format!("Passthrify-{ver}.zip"),
+            package_url: format!("{base}/pkg.zip"),
+            package_size: 0,
             sha_url: format!("{base}/pkg.zip.sha256"),
         }
     }
@@ -648,7 +844,7 @@ mod tests {
         let base = serve(vec![("/pkg.zip.sha256", sha.into_bytes()), ("/pkg.zip", zip)], 2);
         let progress = std::sync::Mutex::new(Vec::new());
         let dir = download_and_stage(&release_at(&base, "9.9.1"), |p| progress.lock().unwrap().push(p)).unwrap();
-        assert_eq!(std::fs::read(dir.join("passthrify.exe")).unwrap(), b"new exe");
+        assert_eq!(std::fs::read(dir.join(EXE)).unwrap(), b"new exe");
         assert!(dir.join("avcodec-62.dll").is_file());
         assert_eq!(*progress.lock().unwrap().last().unwrap(), 1.0);
         let _ = std::fs::remove_dir_all(staging_root().join("9.9.1"));
@@ -664,22 +860,90 @@ mod tests {
         assert!(!staging_root().join("9.9.2").exists(), "corrupt download must be deleted");
     }
 
+    /// A release tarball: `Passthrify/passthrify` (executable) and a bundled library.
+    #[cfg(target_os = "linux")]
+    fn test_tarball() -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let mut add = |path: &str, mode: u32, body: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(mode);
+                h.set_cksum();
+                tar.append_data(&mut h, path, body).unwrap();
+            };
+            add("Passthrify/passthrify", 0o755, b"new elf");
+            add("Passthrify/lib/libavcodec.so.62", 0o644, &[7u8; 50_000]);
+            tar.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tarball_update_keeps_the_exe_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tgz = test_tarball();
+        let sha = format!("{:x}  Passthrify-9.9.3-linux-x86_64.tar.gz\n", Sha256::digest(&tgz));
+        let base = serve(vec![("/pkg.tgz.sha256", sha.into_bytes()), ("/pkg.tgz", tgz)], 2);
+        let mut rel = release_at(&base, "9.9.3");
+        rel.kind = InstallKind::Tarball;
+        rel.package_name = "Passthrify-9.9.3-linux-x86_64.tar.gz".into();
+        rel.package_url = format!("{base}/pkg.tgz");
+        rel.sha_url = format!("{base}/pkg.tgz.sha256");
+        let dir = download_and_stage(&rel, |_| {}).unwrap();
+        let exe = dir.join(EXE);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new elf");
+        assert_eq!(std::fs::metadata(&exe).unwrap().permissions().mode() & 0o111, 0o111, "exe must stay executable");
+        assert!(dir.join("lib/libavcodec.so.62").is_file());
+
+        // Installing over an old copy replaces the file and keeps the mode.
+        let install = staging_root().join("9.9.3-install");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join(EXE), b"old elf").unwrap();
+        copy_tree(&dir, &install).unwrap();
+        assert_eq!(std::fs::read(install.join(EXE)).unwrap(), b"new elf");
+        assert_eq!(std::fs::metadata(install.join(EXE)).unwrap().permissions().mode() & 0o111, 0o111);
+        let leftovers: Vec<_> = std::fs::read_dir(&install).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("update-tmp")).collect();
+        assert!(leftovers.is_empty(), "temp files left behind");
+        let _ = std::fs::remove_dir_all(staging_root().join("9.9.3"));
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn appimage_is_swapped_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("pt-appimage-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("Passthrify.AppImage");
+        std::fs::write(&target, b"old").unwrap();
+        let part = base.join(".Passthrify-9.9.4-x86_64.AppImage.part");
+        std::fs::write(&part, b"new").unwrap();
+        install_appimage(&part, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn copy_tree_and_app_dir() {
         let base = std::env::temp_dir().join(format!("pt-updater-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let pkg = base.join("extracted").join("Passthrify");
         std::fs::create_dir_all(pkg.join("sub")).unwrap();
-        std::fs::write(pkg.join("passthrify.exe"), b"new").unwrap();
+        std::fs::write(pkg.join(EXE), b"new").unwrap();
         std::fs::write(pkg.join("sub").join("a.txt"), b"x").unwrap();
         let app = find_app_dir(&base.join("extracted")).unwrap();
         assert_eq!(app, pkg);
 
         let install = base.join("install");
         std::fs::create_dir_all(&install).unwrap();
-        std::fs::write(install.join("passthrify.exe"), b"old").unwrap();
+        std::fs::write(install.join(EXE), b"old").unwrap();
         assert_eq!(copy_tree(&app, &install).unwrap(), 2);
-        assert_eq!(std::fs::read(install.join("passthrify.exe")).unwrap(), b"new");
+        assert_eq!(std::fs::read(install.join(EXE)).unwrap(), b"new");
         assert!(install.join("sub").join("a.txt").is_file());
         let _ = std::fs::remove_dir_all(&base);
     }

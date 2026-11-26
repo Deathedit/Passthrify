@@ -35,8 +35,13 @@ pub struct App {
     sidebar_open: bool,
     /// Sidebar state to restore when leaving fullscreen.
     sidebar_before_fullscreen: bool,
+    /// The window's fullscreen state as last reported, to notice the window manager changing it.
+    seen_fullscreen: Option<bool>,
     /// The first frame has not run yet (the window size is unknown until then).
     first_frame: bool,
+    /// The window manager decorates the window (Linux; follows the Title bar setting live).
+    #[cfg(target_os = "linux")]
+    native_decorations: bool,
     /// egui time until which the show-sidebar button stays visible.
     show_button_until: f64,
     /// egui time of the last mouse movement or click (hides the cursor over the video when idle).
@@ -148,7 +153,7 @@ pub fn hotkey_parts(s: &str) -> Vec<String> {
                 "control" | "ctrl" => "Ctrl".into(),
                 "alt" | "option" => "Alt".into(),
                 "shift" => "Shift".into(),
-                "super" | "meta" | "win" | "cmd" => "Win".into(),
+                "super" | "meta" | "win" | "cmd" => if cfg!(windows) { "Win" } else { "Super" }.into(),
                 _ => p.to_string(),
             }
         })
@@ -175,9 +180,25 @@ impl App {
         tray::style_title_bar(hwnd);
         super::frame::install(hwnd);
 
+        // `passthrify --action …` and second launches (control.rs).
+        #[cfg(unix)]
+        {
+            let ctx = cc.egui_ctx.clone();
+            crate::control::serve(pipeline.sender(), move || {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            });
+        }
+
+        #[cfg(target_os = "linux")]
+        let native_decorations = !cfg.title_bar.app_drawn();
         let mut hotkey_errors = Vec::new();
-        let hotkeys = match Hotkeys::new(pipeline.sender()) {
-            Ok(mut h) => {
+        // Wayland: the compositor binds `passthrify --action …` instead (Settings › Hotkeys).
+        let manager = if crate::hotkeys::wayland_session() { Ok(None) } else { Hotkeys::new(pipeline.sender()).map(Some) };
+        let hotkeys = match manager {
+            Ok(None) => None,
+            Ok(Some(mut h)) => {
                 hotkey_errors = h.apply(&cfg);
                 Some(h)
             }
@@ -189,7 +210,11 @@ impl App {
         for e in &hotkey_errors {
             shared.notify(format!("Hotkey problem: {e}"), true);
         }
-        let tray = match tray::create(hwnd, pipeline.sender()) {
+        #[cfg(windows)]
+        let tray = tray::create(hwnd, pipeline.sender());
+        #[cfg(target_os = "linux")]
+        let tray = tray::create(&cc.egui_ctx, pipeline.sender());
+        let tray = match tray {
             Ok(t) => Some(t),
             Err(e) => {
                 tracing::warn!("tray icon unavailable: {e:#}");
@@ -221,7 +246,10 @@ impl App {
             announced_update: None,
             sidebar_open: true,
             sidebar_before_fullscreen: true,
+            seen_fullscreen: None,
             first_frame: true,
+            #[cfg(target_os = "linux")]
+            native_decorations,
             show_button_until: 0.0,
             cursor_moved_at: 0.0,
         };
@@ -243,8 +271,15 @@ impl App {
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        if self.follow_fullscreen(on) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        }
+    }
+
+    /// Switches the layout in or out of fullscreen; false if it already was.
+    fn follow_fullscreen(&mut self, on: bool) -> bool {
         if on == self.fullscreen {
-            return;
+            return false;
         }
         // The sidebar steps aside in fullscreen and comes back afterwards.
         if on {
@@ -254,7 +289,7 @@ impl App {
             self.sidebar_open = self.sidebar_before_fullscreen;
         }
         self.fullscreen = on;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        true
     }
 
     /// Shows or hides the sidebar at the user's request (remembered in the config).
@@ -749,14 +784,18 @@ impl App {
     /// minimize / maximize / close on the right.
     fn title_bar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.allocate_rect(rect, egui::Sense::hover());
         let ctx = ui.ctx().clone();
         let (focused, maximized) =
             ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().maximized.unwrap_or(false)));
+        // Windows: the window procedure makes this area drag the window. Linux: egui does.
+        #[cfg(windows)]
+        ui.allocate_rect(rect, egui::Sense::hover());
+        #[cfg(target_os = "linux")]
+        super::frame::title_bar(&ui.allocate_rect(rect, egui::Sense::click_and_drag()), maximized);
         let p = ui.painter();
         p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, theme::DIVIDER));
         let cy = rect.center().y;
-        let logo = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, cy), egui::Vec2::splat(16.0));
+        let logo = egui::Rect::from_center_size(egui::pos2(rect.left() + 20.0, cy), theme::mark_size(16.0));
         let tint = if focused { Color32::WHITE } else { Color32::from_white_alpha(140) };
         theme::mark_image(16.0).tint(tint).paint_at(ui, logo);
         let title_color = if focused { theme::TEXT2 } else { theme::TEXT3 };
@@ -951,7 +990,7 @@ impl App {
                     (None, _) => ("Waiting for video…".to_string(), String::new()),
                 };
                 let c = rect.center();
-                let img = egui::Rect::from_center_size(c - egui::vec2(0.0, 40.0), egui::Vec2::splat(72.0));
+                let img = egui::Rect::from_center_size(c - egui::vec2(0.0, 40.0), theme::mark_size(72.0));
                 theme::mark_image(72.0).tint(Color32::from_white_alpha(90)).paint_at(ui, img);
                 let p = ui.painter();
                 p.text(c + egui::vec2(0.0, 12.0), egui::Align2::CENTER_CENTER, title, FontId::new(16.0, theme::semibold()), theme::TEXT2);
@@ -1068,6 +1107,7 @@ impl App {
                 c.stream_fps = 0;
                 c.stream_bitrate_kbps = 0;
                 c.present_mode = crate::config::PresentMode::Mailbox;
+                c.title_bar = crate::config::TitleBar::Auto;
                 c.windows_notifications = false;
                 c.sidebar_open = false;
                 // Frame generation applies live (FrameGen::configure).
@@ -1139,8 +1179,23 @@ impl eframe::App for App {
             }
         }
 
+        // The window manager can enter or leave fullscreen on its own (niri's fullscreen key,
+        // moving the window): follow it, or the title bar stays hidden on a normal window.
+        let reported = ctx.input(|i| i.viewport().fullscreen);
+        if reported.is_some() && reported != self.seen_fullscreen {
+            self.seen_fullscreen = reported;
+            self.follow_fullscreen(reported == Some(true));
+        }
+
+        let app_title_bar = self.cfg.title_bar.app_drawn();
+        #[cfg(target_os = "linux")]
+        if self.native_decorations == app_title_bar {
+            self.native_decorations = !app_title_bar;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!app_title_bar));
+        }
+
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        if self.fullscreen {
+        if self.fullscreen || !app_title_bar {
             super::frame::set_layout(0, 0, false);
         } else {
             egui::TopBottomPanel::top("title_bar")
@@ -1155,6 +1210,8 @@ impl eframe::App for App {
                 (3.0 * CAPTION_BUTTON_W * ppp).round() as i32,
                 !maximized,
             );
+        }
+        if !self.fullscreen {
             egui::TopBottomPanel::bottom("status")
                 .frame(
                     egui::Frame::new()
@@ -1194,7 +1251,9 @@ impl eframe::App for App {
         self.toasts(ctx);
 
         // Our 1 px window border (the native one is gone); none when maximized or fullscreen.
-        if !self.fullscreen && !maximized {
+        if !self.fullscreen && !maximized && app_title_bar {
+            #[cfg(target_os = "linux")]
+            super::frame::resize_edges(ctx);
             ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))).rect_stroke(
                 ctx.screen_rect(),
                 0,

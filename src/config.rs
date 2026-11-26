@@ -148,6 +148,38 @@ pub enum PresentMode {
     Fifo,
 }
 
+/// Who draws the window's title bar and edges. Linux only: on Windows Passthrify always draws
+/// its own inside the native frame (ui/frame.rs).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TitleBar {
+    /// The window manager's, except on GNOME, which leaves title bars to apps.
+    #[default]
+    Auto,
+    /// Passthrify's own title bar and border.
+    App,
+    /// The window manager's: none on tiling ones like niri, Hyprland or Sway.
+    System,
+}
+
+impl TitleBar {
+    /// Passthrify draws the title bar (and window border) itself.
+    pub fn app_drawn(self) -> bool {
+        if cfg!(windows) {
+            return true;
+        }
+        match self {
+            TitleBar::App => true,
+            TitleBar::System => false,
+            TitleBar::Auto => gnome_session(),
+        }
+    }
+}
+
+/// GNOME (and Ubuntu's GNOME) has no window-manager title bars on Wayland.
+fn gnome_session() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|s| s.eq_ignore_ascii_case("gnome")))
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct ModePref {
     pub width: u32,
@@ -168,7 +200,7 @@ pub struct Config {
     pub color_range: crate::color::RangePref,
     /// Audio capture endpoint name substring; None = auto-match the capture card.
     pub audio_input: Option<String>,
-    /// Audio render endpoint for passthrough; None = Windows default output.
+    /// Audio render endpoint for passthrough; None = the system's default output.
     pub audio_output: Option<String>,
     pub passthrough_enabled: bool,
     pub volume: f32,
@@ -191,6 +223,7 @@ pub struct Config {
 
     pub windows_notifications: bool,
     pub present_mode: PresentMode,
+    pub title_bar: TitleBar,
 
     /// Which releases to offer: stable only, or pre-releases too.
     pub update_channel: crate::updater::UpdateChannel,
@@ -215,7 +248,7 @@ pub struct Config {
     pub gpu_frames: bool,
 
     /// Live streaming: service, Custom server URL, output height (0 = source), max frame rate
-    /// and video bitrate. The stream key lives in Windows Credential Manager, not here.
+    /// and video bitrate. The stream key lives in the system's credential store (secrets.rs), not here.
     pub stream_service: StreamService,
     pub stream_server: String,
     pub stream_height: u32,
@@ -226,15 +259,18 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let user = directories::UserDirs::new();
+        // Linux without XDG user dirs configured has no Videos/Pictures entry: use ~/Videos and
+        // ~/Pictures rather than the working directory.
+        let home = || user.as_ref().map(|d| d.home_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let output_dir = user
             .as_ref()
             .and_then(|d| d.video_dir().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(|| home().join("Videos"))
             .join("Passthrify");
         let screenshot_dir = user
             .as_ref()
             .and_then(|d| d.picture_dir().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| output_dir.clone())
+            .unwrap_or_else(|| home().join("Pictures"))
             .join("Passthrify");
         Self {
             video_device: None,
@@ -258,6 +294,7 @@ impl Default for Config {
             hotkey_toggle_stream: "Alt+F8".into(),
             windows_notifications: true,
             present_mode: PresentMode::Mailbox,
+            title_bar: TitleBar::Auto,
             update_channel: crate::updater::UpdateChannel::Stable,
             check_updates: true,
             update_repo: None,

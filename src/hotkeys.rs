@@ -15,6 +15,13 @@ use parking_lot::Mutex;
 use crate::config::Config;
 use crate::pipeline::{Action, Command};
 
+/// A Wayland session: apps can't grab global keys there (global-hotkey goes through X11 and
+/// would only see keys while an XWayland window has focus), so the compositor binds
+/// `passthrify --action …` instead (control.rs).
+pub fn wayland_session() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+}
+
 pub struct Hotkeys {
     manager: GlobalHotKeyManager,
     registered: Vec<HotKey>,

@@ -6,14 +6,19 @@
 //! VideoFrameGenerationEffectApp sample. `NvCVImage` is only ever handled through pointers
 //! the SDK allocates (NvCVImage_Create), so its struct layout isn't needed here.
 
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+
 use std::ffi::{c_char, c_void, CStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
+#[cfg(windows)]
 use windows::core::{HSTRING, PCSTR};
+#[cfg(windows)]
 use windows::Win32::Foundation::HMODULE;
+#[cfg(windows)]
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, SetDllDirectoryW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
 };
@@ -206,6 +211,9 @@ pub fn load(configured: Option<&Path>) -> Result<Arc<Sdk>> {
     static LOADED: OnceLock<Mutex<Option<Arc<Sdk>>>> = OnceLock::new();
     let cell = LOADED.get_or_init(|| Mutex::new(None));
     let mut slot = cell.lock();
+    if cfg!(not(windows)) {
+        bail!("frame generation needs Windows: NVIDIA's frame generation runtime is Windows-only");
+    }
     let dir = find_runtime(configured).ok_or_else(|| {
         anyhow!("NVIDIA Video Effects SDK with Video Frame Generation not found (needs {CORE_DLL}, {IMAGE_DLL} and {FEATURE_DLL})")
     })?;
@@ -220,11 +228,13 @@ pub fn load(configured: Option<&Path>) -> Result<Arc<Sdk>> {
     Ok(sdk)
 }
 
+#[cfg(windows)]
 unsafe fn open_lib(path: &Path) -> Result<HMODULE> {
     LoadLibraryExW(&HSTRING::from(path), None, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
         .with_context(|| format!("loading {}", path.display()))
 }
 
+#[cfg(windows)]
 unsafe fn sym<T>(lib: HMODULE, name: &str) -> Result<T> {
     let cname = format!("{name}\0");
     let p = GetProcAddress(lib, PCSTR(cname.as_ptr())).ok_or_else(|| anyhow!("{name} missing from the SDK"))?;
@@ -232,6 +242,12 @@ unsafe fn sym<T>(lib: HMODULE, name: &str) -> Result<T> {
 }
 
 impl Sdk {
+    #[cfg(not(windows))]
+    unsafe fn open(_dir: &Path) -> Result<Self> {
+        bail!("frame generation needs Windows")
+    }
+
+    #[cfg(windows)]
     unsafe fn open(dir: &Path) -> Result<Self> {
         // The core DLL loads the feature DLL and its CUDA/TensorRT dependencies by name.
         let _ = SetDllDirectoryW(&HSTRING::from(dir));
@@ -601,10 +617,11 @@ mod tests {
     #[test]
     fn vfg_next_to_the_exe_comes_first() {
         let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-        let dirs = candidate_dirs(Some(Path::new(r"D:\elsewhere")));
+        let elsewhere = if cfg!(windows) { r"D:\elsewhere" } else { "/elsewhere" };
+        let dirs = candidate_dirs(Some(Path::new(elsewhere)));
         assert_eq!(dirs[0], exe_dir.join("vfg"));
         assert_eq!(dirs[1], exe_dir.join("vfg").join("bin"));
-        assert_eq!(dirs[2], PathBuf::from(r"D:\elsewhere"), "then the config override");
+        assert_eq!(dirs[2], PathBuf::from(elsewhere), "then the config override");
     }
 
     #[test]

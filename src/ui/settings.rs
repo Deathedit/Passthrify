@@ -10,9 +10,9 @@ use eframe::egui::{self, FontId, Margin, RichText, Stroke, Vec2};
 use super::app::{hotkey_parts, pretty_hotkey};
 use super::pickers;
 use super::theme::{self, icons, Kind};
-use crate::capture::video_mf::VideoMode;
+use crate::capture::VideoMode;
 use crate::color::{ColorInfo, RangePref};
-use crate::config::{Chroma, Codec, Config, PresentMode, StreamService};
+use crate::config::{Chroma, Codec, Config, PresentMode, StreamService, TitleBar};
 use crate::updater::{self, UpdateChannel, UpdateState, Updater};
 
 pub enum SettingsOutcome {
@@ -256,6 +256,7 @@ impl SettingsUi {
             Section::Display => {
                 d.windows_notifications = def.windows_notifications;
                 d.present_mode = def.present_mode;
+                d.title_bar = def.title_bar;
                 d.frame_gen = def.frame_gen;
                 d.frame_gen_quality = def.frame_gen_quality;
                 d.frame_gen_multiplier = def.frame_gen_multiplier;
@@ -312,7 +313,7 @@ impl SettingsUi {
             ui.add_space(6.0);
 
             theme::field_label(ui, "Input range");
-            egui::ComboBox::from_id_salt("s_range").selected_text(d.color_range.label()).width(w).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("s_range").selected_text(d.color_range.label()).width(w).truncate().show_ui(ui, |ui| {
                 for r in RangePref::ALL {
                     ui.selectable_value(&mut d.color_range, r, r.label());
                 }
@@ -340,7 +341,7 @@ impl SettingsUi {
             ui.add_space(8.0);
             ui.add_enabled_ui(d.passthrough_enabled, |ui| {
                 theme::field_label(ui, "Output device");
-                optional_combo(ui, "s_audio_out", &mut d.audio_output, outputs, "Windows default", w);
+                optional_combo(ui, "s_audio_out", &mut d.audio_output, outputs, if cfg!(windows) { "Windows default" } else { "System default" }, w);
             });
         });
     }
@@ -479,14 +480,15 @@ impl SettingsUi {
                                 .sense(egui::Sense::click()),
                         );
                         if link.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                            let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+                            crate::shell::open_url(url);
                         }
                     });
                 }
             });
             let hint = if d.stream_service == StreamService::Custom { "Optional" } else { "Paste your stream key" };
             ui.add(egui::TextEdit::singleline(key).password(true).hint_text(hint).desired_width(w));
-            ui.label(RichText::new("Kept in Windows Credential Manager, not in the settings file.").size(12.0).color(theme::TEXT3));
+            let store = if cfg!(windows) { "Windows Credential Manager" } else { "the system keyring" };
+            ui.label(RichText::new(format!("Kept in {store}, not in the settings file.")).size(12.0).color(theme::TEXT3));
             ui.add_space(10.0);
 
             theme::field_label(ui, "Resolution");
@@ -501,6 +503,9 @@ impl SettingsUi {
     }
 
     fn hotkeys_card(&mut self, ui: &mut egui::Ui, hotkey_errors: &[String]) {
+        if crate::hotkeys::wayland_session() {
+            return wayland_hotkeys_card(ui);
+        }
         let capture = self.capture;
         let mut start: Option<Option<HotkeyField>> = None;
         let d = &mut self.draft;
@@ -582,16 +587,30 @@ impl SettingsUi {
         section_body(ui, |ui| {
             frame_gen_fields(ui, d, frame_gen);
             ui.add_space(14.0);
-            theme::toggle_row(ui, "Windows notification when a clip is saved", &mut d.windows_notifications);
+            theme::toggle_row(ui, if cfg!(windows) { "Windows notification when a clip is saved" } else { "Desktop notification when a clip is saved" }, &mut d.windows_notifications);
             ui.add_space(10.0);
             theme::field_label(ui, "Presentation");
             let w = ui.available_width();
-            egui::ComboBox::from_id_salt("s_present").selected_text(present_label(d.present_mode)).width(w).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("s_present").selected_text(present_label(d.present_mode)).width(w).truncate().show_ui(ui, |ui| {
                 for p in [PresentMode::Mailbox, PresentMode::Immediate, PresentMode::Fifo] {
                     ui.selectable_value(&mut d.present_mode, p, present_label(p));
                 }
             });
             ui.label(RichText::new("Takes effect after restarting Passthrify.").size(12.0).color(theme::TEXT3));
+            if cfg!(target_os = "linux") {
+                ui.add_space(10.0);
+                theme::field_label(ui, "Title bar");
+                egui::ComboBox::from_id_salt("s_title_bar").selected_text(title_bar_label(d.title_bar)).width(w).truncate().show_ui(ui, |ui| {
+                    for t in [TitleBar::Auto, TitleBar::System, TitleBar::App] {
+                        ui.selectable_value(&mut d.title_bar, t, title_bar_label(t));
+                    }
+                });
+                ui.label(
+                    RichText::new("Auto leaves it to the window manager (none on niri, Hyprland or Sway), except on GNOME, which needs Passthrify's own.")
+                        .size(12.0)
+                        .color(theme::TEXT3),
+                );
+            }
         });
     }
 
@@ -710,7 +729,7 @@ impl SettingsUi {
                     ui.add_space(8.0);
                     if let UpdateState::Downloading { progress, .. } = state {
                         // Text above a thin bar: text on the cyan fill itself would be unreadable.
-                        let total_mb = rel.zip_size as f64 / 1_048_576.0;
+                        let total_mb = rel.package_size as f64 / 1_048_576.0;
                         let done_mb = total_mb * progress as f64;
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Downloading…").size(12.0).color(egui::Color32::WHITE));
@@ -729,7 +748,7 @@ impl SettingsUi {
                         ui.painter().rect_filled(fill, 3, theme::SIGNAL);
                     } else {
                         let reason = if recording { Some("Stop the recording first.".to_string()) } else { blocker.clone() };
-                        let size_mb = rel.zip_size as f64 / 1_048_576.0;
+                        let size_mb = rel.package_size as f64 / 1_048_576.0;
                         let install = ui.add_enabled_ui(reason.is_none() && !downloading, |ui| {
                             theme::button(ui, Kind::Primary, Some(icons::DOWNLOAD), "Install and restart", Some(&format!("{size_mb:.0} MB")))
                         });
@@ -863,7 +882,7 @@ fn frame_gen_fields(ui: &mut egui::Ui, d: &mut Config, fg: &crate::vfg::FrameGen
         ui.add_space(4.0);
         theme::field_label(ui, "Output");
         let mult_label = |m: u32| format!("x{m}");
-        egui::ComboBox::from_id_salt("s_fg_mult").selected_text(mult_label(d.frame_gen_multiplier)).width(w).show_ui(
+        egui::ComboBox::from_id_salt("s_fg_mult").selected_text(mult_label(d.frame_gen_multiplier)).width(w).truncate().show_ui(
             ui,
             |ui| {
                 for m in 2..=4 {
@@ -872,7 +891,7 @@ fn frame_gen_fields(ui: &mut egui::Ui, d: &mut Config, fg: &crate::vfg::FrameGen
             },
         );
         theme::field_label(ui, "Model");
-        egui::ComboBox::from_id_salt("s_fg_quality").selected_text(d.frame_gen_quality.label()).width(w).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("s_fg_quality").selected_text(d.frame_gen_quality.label()).width(w).truncate().show_ui(ui, |ui| {
             for q in Quality::ALL {
                 ui.selectable_value(&mut d.frame_gen_quality, q, q.label());
             }
@@ -955,6 +974,14 @@ fn folder_row(ui: &mut egui::Ui, path: &mut std::path::PathBuf) -> bool {
     .inner
 }
 
+fn title_bar_label(t: TitleBar) -> &'static str {
+    match t {
+        TitleBar::Auto => "Auto",
+        TitleBar::System => "Window manager's",
+        TitleBar::App => "Passthrify's own",
+    }
+}
+
 fn present_label(p: PresentMode) -> &'static str {
     match p {
         PresentMode::Mailbox => "Low latency (mailbox)",
@@ -965,12 +992,14 @@ fn present_label(p: PresentMode) -> &'static str {
 
 fn optional_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<String>, options: &[String], auto: &str, width: f32) {
     let text = value.clone().unwrap_or_else(|| auto.to_string());
-    egui::ComboBox::from_id_salt(id).selected_text(text).width(width).show_ui(ui, |ui| {
+    // Device names can be long (PipeWire's especially): truncated in the box, full on hover.
+    let resp = egui::ComboBox::from_id_salt(id).selected_text(text.as_str()).width(width).truncate().show_ui(ui, |ui| {
         ui.selectable_value(value, None, auto);
         for o in options {
             ui.selectable_value(value, Some(o.clone()), o);
         }
     });
+    resp.response.on_hover_text(text);
 }
 
 #[cfg(test)]
@@ -987,3 +1016,47 @@ mod tests {
         assert_eq!(hotkey_string(Key::R, Modifiers::NONE), None, "bare letters would fire while typing");
     }
 }
+
+/// Settings › Hotkeys on Wayland: apps can't grab global keys, so list the commands to bind in
+/// the compositor (control.rs serves them).
+#[cfg(target_os = "linux")]
+fn wayland_hotkeys_card(ui: &mut egui::Ui) {
+    section_body(ui, |ui| {
+        ui.label(
+            RichText::new(
+                "Wayland doesn't let apps grab global keys. Bind these commands in your desktop's \
+                 keyboard shortcuts instead; they work while a game or another window has focus.",
+            )
+            .size(12.0)
+            .color(theme::TEXT3),
+        );
+        ui.add_space(8.0);
+        for (name, what) in crate::control::ACTIONS {
+            let cmd = format!("passthrify --action {name}");
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(cmd.as_str()).font(theme::mono(11.0)).color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let copy = ui.add(
+                        egui::Label::new(RichText::new("Copy").font(FontId::new(12.0, theme::medium())).color(theme::SIGNAL))
+                            .sense(egui::Sense::click()),
+                    );
+                    if copy.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(what).clicked() {
+                        ui.ctx().copy_text(cmd.clone());
+                    }
+                });
+            });
+            ui.label(RichText::new(what).size(12.0).color(theme::TEXT3));
+            ui.add_space(4.0);
+        }
+        ui.add_space(6.0);
+        theme::field_label(ui, "Example: niri (~/.config/niri/config.kdl)");
+        let example = "binds {\n    Alt+F10 { spawn \"passthrify\" \"--action\" \"save-replay\"; }\n    Alt+F9 { spawn \"passthrify\" \"--action\" \"toggle-record\"; }\n}";
+        egui::Frame::new().fill(theme::BASE).corner_radius(4).inner_margin(Margin::symmetric(8, 6)).show(ui, |ui| {
+            ui.label(RichText::new(example).font(theme::mono(11.0)).color(theme::TEXT2));
+        });
+        ui.label(RichText::new("Sway / Hyprland: bindsym / bind with exec, the same command.").size(12.0).color(theme::TEXT3));
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wayland_hotkeys_card(_: &mut egui::Ui) {}

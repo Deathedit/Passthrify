@@ -1,13 +1,36 @@
+//! Capture: video and audio from the capture card, one backend per OS behind the same API.
+//! - `video`: `list_devices`, `VideoDevice` ([`Device`]), `run_capture`.
+//!   Media Foundation on Windows, V4L2 on Linux.
+//! - `audio_dev`: `Flow`, `list_endpoints`, `run_capture`, `run_render`.
+//!   WASAPI on Windows, PipeWire on Linux.
+
+pub mod modes;
+
+#[cfg(windows)]
 pub mod audio_wasapi;
+#[cfg(windows)]
 pub mod video_mf;
+#[cfg(windows)]
+pub use {audio_wasapi as audio_dev, video_mf as video};
+
+#[cfg(target_os = "linux")]
+pub mod audio_pipewire;
+#[cfg(target_os = "linux")]
+pub mod video_v4l2;
+#[cfg(target_os = "linux")]
+pub use {audio_pipewire as audio_dev, video_v4l2 as video};
 
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 pub use crate::config::Chroma;
+use crate::color::{ColorInfo, RangePref};
+use crate::config::ModePref;
+pub use modes::{PixFmt, VideoMode};
 
 /// A frame with tightly packed rows: a Y plane (`width * height` bytes) followed by one
 /// interleaved UV plane at chroma resolution (`chroma_size()`, 2 bytes per sample).
@@ -147,36 +170,151 @@ pub const AUDIO_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: usize = 2;
 
 /// COM (MTA) initialised for the lifetime of the guard.
+#[cfg(windows)]
 pub struct ComGuard;
 
+#[cfg(windows)]
 impl ComGuard {
     pub fn new() -> anyhow::Result<Self> {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
         Ok(ComGuard)
     }
 }
 
+#[cfg(windows)]
 impl Drop for ComGuard {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
     }
 }
 
-/// (video devices, audio inputs, audio outputs), enumerated on a fresh MTA thread so it's safe
-/// to call from the UI thread.
+/// Runs `f` on a thread set up for the capture APIs: a fresh MTA thread with Media Foundation
+/// started on Windows (safe to call from the UI thread), the calling thread on Linux.
+fn with_capture_apis<T: Default + Send>(f: impl FnOnce() -> T + Send) -> T {
+    #[cfg(windows)]
+    {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let Ok(_com) = ComGuard::new() else { return T::default() };
+                let Ok(_mf) = video_mf::MfGuard::new() else { return T::default() };
+                f()
+            })
+            .join()
+            .unwrap_or_default()
+        })
+    }
+    #[cfg(not(windows))]
+    f()
+}
+
+/// (video devices, audio inputs, audio outputs).
 pub fn enumerate_all() -> (Vec<String>, Vec<String>, Vec<String>) {
-    std::thread::spawn(|| {
-        let Ok(_com) = ComGuard::new() else { return Default::default() };
-        let video = video_mf::MfGuard::new()
-            .and_then(|_mf| video_mf::list_devices())
-            .map(|v| v.into_iter().map(|d| d.name).collect())
-            .unwrap_or_default();
-        let ain = audio_wasapi::list_endpoints(audio_wasapi::Flow::Capture).unwrap_or_default();
-        let aout = audio_wasapi::list_endpoints(audio_wasapi::Flow::Render).unwrap_or_default();
+    with_capture_apis(|| {
+        let video = video::list_devices().map(|v| v.into_iter().map(|d| d.name).collect()).unwrap_or_default();
+        let ain = audio_dev::list_endpoints(audio_dev::Flow::Capture).unwrap_or_default();
+        let aout = audio_dev::list_endpoints(audio_dev::Flow::Render).unwrap_or_default();
         (video, ain, aout)
     })
-    .join()
-    .unwrap_or_default()
+}
+
+/// Each video device with its modes (or why it couldn't be opened), for `--list-devices`.
+pub fn describe_devices() -> Result<Vec<(String, Result<Vec<VideoMode>>)>> {
+    with_capture_apis(|| -> Option<Result<_>> {
+        Some(video::list_devices().map(|devs| {
+            devs.into_iter()
+                .map(|d| {
+                    let modes = <video::VideoDevice as Device>::open(Some(&d.name)).map(|dev| dev.modes().to_vec());
+                    (d.name, modes)
+                })
+                .collect()
+        }))
+    })
+    .unwrap_or_else(|| Err(anyhow!("capture APIs unavailable")))
+}
+
+/// A video capture device as the capture loop drives it.
+pub trait Device: Sized {
+    /// Opens the device whose name contains `name_pref` (case-insensitive), or the first
+    /// Elgato-looking device, or the first device.
+    fn open(name_pref: Option<&str>) -> Result<Self>;
+    fn name(&self) -> &str;
+    fn modes(&self) -> &[VideoMode];
+    fn set_mode(&mut self, mode: &VideoMode, chroma: Chroma, range: RangePref) -> Result<()>;
+    /// The mode set last and the chroma it yields.
+    fn current(&self) -> Option<(VideoMode, Chroma)>;
+    /// Range + matrix of the frames handed out.
+    fn color(&self) -> ColorInfo;
+    /// Waits for the next frame and converts it to the packed Y + interleaved-UV layout.
+    /// `Ok(None)` for stream ticks, gaps and timeouts (so the caller can check its stop flag).
+    fn read_frame(&mut self, pool: &Arc<FramePool>, seq: u64) -> Result<Option<VideoFrame>>;
+}
+
+/// Capture loop with automatic reconnect. Runs until `stop` is set. `on_open` is called each
+/// time the device is (re)opened with the chosen mode and the chroma it delivers.
+pub fn run_capture_loop<D: Device>(
+    device: Option<String>,
+    pref: Option<ModePref>,
+    chroma: Chroma,
+    range: RangePref,
+    stop: Arc<AtomicBool>,
+    mut on_open: impl FnMut(Result<(String, Vec<VideoMode>, VideoMode, Chroma, ColorInfo)>),
+    mut on_frame: impl FnMut(VideoFrame),
+) {
+    let pool = Arc::new(FramePool::pinned());
+    let mut seq = 0u64;
+
+    while !stop.load(Ordering::Relaxed) {
+        let opened = (|| -> Result<D> {
+            let mut dev = D::open(device.as_deref())?;
+            let (mode, out_chroma) = modes::choose_mode(dev.modes(), pref.as_ref(), chroma)
+                .ok_or_else(|| anyhow!("'{}' offers no NV12/YUY2/RGB24 modes: {:?}", dev.name(), dev.modes()))?;
+            dev.set_mode(&mode, out_chroma, range)?;
+            Ok(dev)
+        })();
+        let mut dev = match opened {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("video capture: {e:#}");
+                on_open(Err(e));
+                sleep_unless_stopped(&stop, 2000);
+                continue;
+            }
+        };
+        let (mode, out_chroma) = dev.current().expect("mode set");
+        tracing::info!("capturing '{}' at {mode} -> {} {}", dev.name(), out_chroma.label(), dev.color().label());
+        on_open(Ok((dev.name().to_string(), dev.modes().to_vec(), mode, out_chroma, dev.color())));
+
+        while !stop.load(Ordering::Relaxed) {
+            match dev.read_frame(&pool, seq) {
+                Ok(Some(frame)) => {
+                    seq += 1;
+                    on_frame(frame);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if !stop.load(Ordering::Relaxed) {
+                        tracing::warn!("capture error: {e:#}; reconnecting");
+                        on_open(Err(e.context("capture stopped")));
+                    }
+                    break;
+                }
+            }
+        }
+        tracing::debug!("video capture: releasing device");
+        drop(dev);
+        tracing::debug!("video capture: device released");
+        sleep_unless_stopped(&stop, 500);
+    }
+    tracing::debug!("video capture: exiting");
+}
+
+pub fn sleep_unless_stopped(stop: &AtomicBool, ms: u64) {
+    let mut left = ms;
+    while left > 0 && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(left.min(100)));
+        left = left.saturating_sub(100);
+    }
 }
 
 /// Names that identify Elgato hardware, used for auto-detection.

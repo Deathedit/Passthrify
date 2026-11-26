@@ -1,4 +1,4 @@
-//! System tray icon + menu. Window show/hide uses Win32 directly so it works even while eframe
+//! Windows tray icon + menu. Window show/hide uses Win32 directly so it works even while eframe
 //! isn't repainting a hidden window.
 
 use anyhow::Result;
@@ -10,30 +10,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, WM_CLOSE,
 };
 
+use super::tray_icon_rgba;
 use crate::pipeline::Command;
 
 pub struct Tray {
     _icon: TrayIcon,
-}
-
-/// "Lens P" on its dark tile (window / taskbar / exe icon).
-const MARK_SVG: &[u8] = include_bytes!("../assets/logo/passthrify-mark.svg");
-/// Pixel-snapped 16 px glyph for the notification area.
-const TRAY_SVG: &[u8] = include_bytes!("../assets/logo/passthrify-tray-16.svg");
-
-/// App icon as straight RGBA, `size`x`size`.
-pub fn app_icon_rgba(size: u32) -> Vec<u8> {
-    crate::svg_raster::rasterize(MARK_SVG, size, size).unwrap_or_else(|e| {
-        tracing::warn!("app icon: {e}");
-        vec![0; (size * size * 4) as usize]
-    })
-}
-
-/// Tray glyph rendered at 2x (32 px) so it stays crisp at 125-200% scaling.
-fn tray_icon_rgba() -> (Vec<u8>, u32) {
-    let size = 32;
-    let rgba = crate::svg_raster::rasterize(TRAY_SVG, size, size).unwrap_or_else(|_| app_icon_rgba(size));
-    (rgba, size)
 }
 
 /// Dark title bar; on Windows 11 also paints the caption in the app's base color.

@@ -5,6 +5,8 @@ mod capture;
 mod clock;
 mod color;
 mod config;
+#[cfg(unix)]
+mod control;
 mod cuda_filter;
 mod encode;
 mod game_fps;
@@ -19,6 +21,7 @@ mod recorder;
 mod replay;
 mod screenshot;
 mod secrets;
+mod shell;
 mod stream;
 mod svg_raster;
 mod tray;
@@ -42,6 +45,9 @@ Passthrify - Elgato capture viewer with instant replay
 USAGE:
   passthrify                    start the app
   passthrify --list-devices     list capture devices, their modes and audio endpoints
+  passthrify --action NAME      (Linux) tell the running app to: save-replay, toggle-record,
+                                screenshot, toggle-stream or show. Bind these in your desktop's
+                                keyboard shortcuts (Wayland has no app-grabbed global hotkeys)
   passthrify --check-update [--repo OWNER/NAME] [--channel stable|prerelease]
                                 check GitHub for a newer release
   passthrify --selftest [SECS] [--out DIR] [--mode WxH@FPS] [--chroma 420|422|444]
@@ -59,7 +65,14 @@ USAGE:
 
 fn main() -> Result<()> {
     clock::init();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Relaunched by the updater (AppImage): let the old copy exit first, then start normally.
+    if let Some(i) = args.iter().position(|a| a == "--wait-pid") {
+        if let Some(pid) = args.get(i + 1).and_then(|p| p.parse().ok()) {
+            updater::wait_for_exit(pid, Duration::from_secs(60));
+        }
+        args.drain(i..(i + 2).min(args.len()));
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         attach_console();
         print!("{USAGE}");
@@ -68,6 +81,21 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--list-devices") {
         attach_console();
         return list_devices();
+    }
+    if let Some(i) = args.iter().position(|a| a == "--render-icon") {
+        // Packaging (build.sh): the app icon as a PNG, from the same SVG the window uses.
+        let size: u32 = args.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| anyhow!("--render-icon SIZE OUT.png"))?;
+        let out = args.get(i + 2).ok_or_else(|| anyhow!("--render-icon SIZE OUT.png"))?;
+        image::save_buffer(out, &tray::app_icon_rgba(size), size, size, image::ColorType::Rgba8)?;
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--action") {
+        attach_console();
+        let name = args.get(i + 1).ok_or_else(|| anyhow!("--action needs a name (see --help)"))?;
+        #[cfg(unix)]
+        return control::send(name);
+        #[cfg(not(unix))]
+        return Err(anyhow!("--action {name}: only on Linux; use the hotkeys on Windows"));
     }
     if args.iter().any(|a| a == "--apply-update") {
         // Installer mode: runs from the staged copy of a new version (see updater.rs).
@@ -90,12 +118,34 @@ fn main() -> Result<()> {
         let releases = updater::fetch_releases(&repo)?;
         println!("{} release(s) found", releases.len());
         match updater::pick_release(&releases, channel, &updater::current_version()) {
-            Some(r) => println!("update available: {} ({} bytes) {}", r.tag, r.zip_size, r.url),
-            None => println!("up to date (no newer release with Passthrify-<ver>.zip + .sha256 assets)"),
+            Some(r) => println!("update available: {} ({} bytes) {}", r.tag, r.package_size, r.url),
+            None => println!(
+                "up to date (no newer release with {} + .sha256 assets)",
+                updater::InstallKind::current().package_name("<ver>")
+            ),
         }
         return Ok(());
     }
+    // One instance: a second launch brings the running one to the front. Checked before the
+    // log file is recreated, so it doesn't wipe the running instance's log.
+    #[cfg(unix)]
+    let control_err = if args.is_empty() {
+        match control::claim() {
+            Ok(true) => None,
+            Ok(false) => {
+                println!("Passthrify is already running; brought it to the front");
+                return Ok(());
+            }
+            Err(e) => Some(e),
+        }
+    } else {
+        None
+    };
     init_logging(!args.is_empty(), "passthrify.log");
+    #[cfg(unix)]
+    if let Some(e) = control_err {
+        tracing::warn!("control socket unavailable ({e:#}); --action won't reach this instance");
+    }
     install_panic_hook();
     ffmpeg_next::init()?;
     ffmpeg_next::util::log::set_level(ffmpeg_next::util::log::Level::Warning);
@@ -145,6 +195,25 @@ fn main() -> Result<()> {
     run_gui()
 }
 
+/// What to do when the swapchain can't hand out an image.
+///
+/// egui's default skips the frame on `Outdated` without rebuilding the swapchain (on Windows
+/// that's a minimized window, fixed by the resize on restore). On Wayland the swapchain can go
+/// out of date while the window keeps its size (around the compositor's first configures), and
+/// then every frame was skipped silently: the window froze on its first frame until a resize.
+fn surface_error_policy() -> Arc<dyn Fn(wgpu::SurfaceError) -> egui_wgpu::SurfaceErrorAction + Send + Sync> {
+    if cfg!(windows) {
+        return egui_wgpu::WgpuConfiguration::default().on_surface_error;
+    }
+    Arc::new(|err| match err {
+        wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost => egui_wgpu::SurfaceErrorAction::RecreateSurface,
+        other => {
+            tracing::warn!("dropped a frame: {other}");
+            egui_wgpu::SurfaceErrorAction::SkipFrame
+        }
+    })
+}
+
 fn run_gui() -> Result<()> {
     let cfg = Config::load();
     let shared = Arc::new(Shared::new(&cfg));
@@ -159,22 +228,49 @@ fn run_gui() -> Result<()> {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("Passthrify")
+            // Wayland matches the window to passthrify.desktop (its icon) through the app id.
+            .with_app_id("passthrify")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([480.0, 300.0])
+            // Windows removes the native caption itself (ui/frame.rs) and keeps the frame's
+            // shadow and snapping. Linux: the window manager's decorations (none on tiling ones),
+            // or egui draws the title bar and border (ui/frame_linux.rs); see TitleBar.
+            .with_decorations(cfg!(windows) || !cfg.title_bar.app_drawn())
             .with_icon(Arc::new(egui::IconData { rgba: tray::app_icon_rgba(128), width: 128, height: 128 })),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             present_mode,
             desired_maximum_frame_latency: Some(1),
+            wgpu_setup: wgpu_setup(),
+            on_surface_error: surface_error_policy(),
             ..Default::default()
         },
         ..Default::default()
     };
-    eframe::run_native(
+    let res = eframe::run_native(
         "Passthrify",
         options,
         Box::new(move |cc| Ok(Box::new(ui::app::App::new(cc, cfg, shared, pipeline)))),
     )
-    .map_err(|e| anyhow!("UI error: {e}"))
+    .map_err(|e| anyhow!("UI error: {e}"));
+    #[cfg(unix)]
+    control::release();
+    res
+}
+
+/// Linux: Vulkan only (not GL), as the preview shares its frame buffer with CUDA through
+/// Vulkan. `WGPU_BACKEND` still overrides it. Windows keeps wgpu's default choice.
+fn wgpu_setup() -> egui_wgpu::WgpuSetup {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        if let Some(setup) = ui::preview::linux_wgpu_setup() {
+            return setup;
+        }
+    }
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::default();
+    if cfg!(target_os = "linux") && std::env::var_os("WGPU_BACKEND").is_none() {
+        setup.instance_descriptor.backends = wgpu::Backends::VULKAN;
+    }
+    egui_wgpu::WgpuSetup::CreateNew(setup)
 }
 
 fn init_logging(to_stderr: bool, file_name: &str) {
@@ -205,7 +301,12 @@ fn install_panic_hook() {
     }));
 }
 
+/// Linux programs always have their terminal; nothing to attach.
+#[cfg(not(windows))]
+fn attach_console() {}
+
 /// Lets a GUI-subsystem build print to the terminal it was started from.
+#[cfg(windows)]
 fn attach_console() {
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     unsafe {
@@ -214,15 +315,14 @@ fn attach_console() {
 }
 
 fn list_devices() -> Result<()> {
-    let _com = capture::ComGuard::new()?;
-    let _mf = capture::video_mf::MfGuard::new()?;
+    use capture::audio_dev::{self, Flow};
     println!("Video capture devices:");
-    for d in capture::video_mf::list_devices()? {
-        println!("  {}", d.name);
-        match capture::video_mf::VideoDevice::open(Some(&d.name)) {
-            Ok(dev) => {
-                let best = dev.choose_mode(None, config::Chroma::S420).map(|(m, _)| m);
-                for m in &dev.modes {
+    for (name, modes) in capture::describe_devices()? {
+        println!("  {name}");
+        match modes {
+            Ok(modes) => {
+                let best = capture::modes::choose_mode(&modes, None, config::Chroma::S420).map(|(m, _)| m);
+                for m in &modes {
                     let mark = if Some(*m) == best { "  <- default" } else { "" };
                     let chroma = if m.format.supported() { m.format.native_chroma().label() } else { "-" };
                     println!("      [{:>3}] {m} ({chroma}){mark}", m.index);
@@ -231,17 +331,10 @@ fn list_devices() -> Result<()> {
             Err(e) => println!("      (can't open: {e:#})"),
         }
     }
-    for (title, flow) in [
-        ("Audio inputs", capture::audio_wasapi::Flow::Capture),
-        ("Audio outputs", capture::audio_wasapi::Flow::Render),
-    ] {
+    for (title, flow) in [("Audio inputs", Flow::Capture), ("Audio outputs", Flow::Render)] {
         println!("{title}:");
-        for n in capture::audio_wasapi::list_endpoints(flow)? {
-            let mark = if flow == capture::audio_wasapi::Flow::Capture && capture::looks_like_elgato(&n) {
-                "  <- auto"
-            } else {
-                ""
-            };
+        for n in audio_dev::list_endpoints(flow)? {
+            let mark = if flow == Flow::Capture && capture::looks_like_elgato(&n) { "  <- auto" } else { "" };
             println!("  {n}{mark}");
         }
     }

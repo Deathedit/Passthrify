@@ -1,9 +1,9 @@
-# Build + test on every push / PR.
+# Build + test on every push / PR, for Windows and Linux.
 # - Push to main: publishes a pre-release dev build (v<next>-dev.<commits>) for the Pre-release
 #   update channel, keeping the newest few.
 # - Push a tag like v0.2.0: publishes a release (a pre-release if the version has a suffix).
-# Releases carry the packaged zip, its SHA-256 and patch notes from the commits since the
-# previous tag.
+# Releases carry the packages (Windows setup + zip, Linux AppImage + tarball), their SHA-256
+# files and patch notes from the commits since the previous tag.
 name: Build
 
 on:
@@ -24,33 +24,24 @@ concurrency:
 env:
   # How many dev pre-releases to keep (older ones and their tags are deleted).
   KEEP_DEV_BUILDS: 5
+  # Baked into the binary (option_env!) so the in-app updater knows where to look.
+  PASSTHRIFY_REPO: ${{ github.repository }}
 
 jobs:
-  build:
-    runs-on: windows-latest
-    env:
-      # Baked into the exe (option_env!) so the in-app updater knows where to look.
-      PASSTHRIFY_REPO: ${{ github.repository }}
+  # kind: release (tag push), dev (main) or none (PRs, other branches).
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      kind: ${{ steps.version.outputs.kind }}
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history + tags for versions and patch notes
+          fetch-depth: 0 # full history + tags for the dev build number
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # build.ps1 downloads FFmpeg 8.1 (LGPL shared) into third_party/ffmpeg when missing.
-      - name: Cache FFmpeg
-        uses: actions/cache@v4
-        with:
-          path: third_party/ffmpeg
-          key: ffmpeg-n8.1-lgpl-shared-${{ hashFiles('build.ps1') }}
-
-      # kind: release (tag push), dev (main) or none (PRs, other branches).
       - name: Resolve version
         id: version
         env:
@@ -70,22 +61,47 @@ jobs:
             $n = (git rev-list --count HEAD).Trim()
             # A dev build must sort above the last release and below the next one.
             if ($ver -match '-') {
-              $dev = "$ver.dev.$n"                          # 0.2.0-beta.1 -> 0.2.0-beta.1.dev.N
+              $ver = "$ver.dev.$n"                          # 0.2.0-beta.1 -> 0.2.0-beta.1.dev.N
             } elseif (git tag -l "v$ver") {
               $p = $ver.Split('.')                          # 0.1.0 released -> 0.1.1-dev.N
-              $dev = "$($p[0]).$($p[1]).$([int]$p[2] + 1)-dev.$n"
+              $ver = "$($p[0]).$($p[1]).$([int]$p[2] + 1)-dev.$n"
             } else {
-              $dev = "$ver-dev.$n"                          # 0.2.0 unreleased -> 0.2.0-dev.N
+              $ver = "$ver-dev.$n"                          # 0.2.0 unreleased -> 0.2.0-dev.N
             }
-            # Stamp it into Cargo.toml so the exe reports it and build.ps1 names the zip after it.
-            $toml = Get-Content Cargo.toml -Raw
-            $toml = ([regex]'(?m)^version\s*=\s*"[^"]+"').Replace($toml, "version = `"$dev`"", 1)
-            Set-Content Cargo.toml $toml -NoNewline -Encoding utf8NoBOM
-            $ver = $dev
           }
           Write-Host "Version $ver ($kind)"
           "version=$ver" >> $env:GITHUB_OUTPUT
           "kind=$kind" >> $env:GITHUB_OUTPUT
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # build.ps1 downloads FFmpeg 8.1 (LGPL shared) into third_party/ffmpeg when missing.
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-n8.1-lgpl-shared-${{ hashFiles('build.ps1') }}
+
+      # Dev builds: stamp the version into Cargo.toml so the exe reports it and build.ps1 names
+      # the packages after it.
+      - name: Stamp version
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          $toml = ([regex]'(?m)^version\s*=\s*"[^"]+"').Replace($toml, "version = `"$env:VERSION`"", 1)
+          Set-Content Cargo.toml $toml -NoNewline -Encoding utf8NoBOM
 
       # The runner image normally ships Inno Setup 6; install it if this one doesn't.
       - name: Inno Setup
@@ -100,33 +116,98 @@ jobs:
         run: ./build.ps1 -Zip -Installer
 
       - name: Checksum
-        id: checksum
         run: |
-          $ver = "${{ steps.version.outputs.version }}"
-          foreach ($file in "dist/Passthrify-$ver.zip", "dist/Passthrify-$ver-setup.exe") {
+          foreach ($file in "dist/Passthrify-$env:VERSION.zip", "dist/Passthrify-$env:VERSION-setup.exe") {
             $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
             "$hash  $(Split-Path $file -Leaf)" | Out-File -Encoding ascii "$file.sha256"
           }
-          "sha256=$((Get-FileHash "dist/Passthrify-$ver.zip" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
-          "setup_sha256=$((Get-FileHash "dist/Passthrify-$ver-setup.exe" -Algorithm SHA256).Hash.ToLower())" >> $env:GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Passthrify-${{ steps.version.outputs.version }}-${{ github.sha }}
+          name: Passthrify-${{ env.VERSION }}-windows-${{ github.sha }}
           path: |
-            dist/Passthrify-${{ steps.version.outputs.version }}.zip
-            dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
-            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe
-            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe.sha256
+            dist/Passthrify-${{ env.VERSION }}.zip
+            dist/Passthrify-${{ env.VERSION }}.zip.sha256
+            dist/Passthrify-${{ env.VERSION }}-setup.exe
+            dist/Passthrify-${{ env.VERSION }}-setup.exe.sha256
           if-no-files-found: error
 
-      # ---- Release (tag pushes and main) --------------------------------------------------
+  linux:
+    needs: version
+    # The oldest supported runner: the binary needs this glibc (2.39) or newer, and PipeWire
+    # 0.3.49+ (22.04 has 0.3.48).
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev clang pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # build.sh downloads FFmpeg 8.1 (LGPL shared) into third_party/ffmpeg-linux when missing.
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg-linux
+          key: ffmpeg-n8.1-lgpl-shared-linux-${{ hashFiles('build.sh') }}
+
+      - name: Stamp version
+        run: sed -i "0,/^version *= *\".*\"/s//version = \"$VERSION\"/" Cargo.toml
+
+      # Prerequisite checks, tests, release build, dist/Passthrify + the tarball + the AppImage
+      # (each with its .sha256).
+      - name: Test, build and package
+        run: ./build.sh --tarball --appimage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Passthrify-${{ env.VERSION }}-linux-${{ github.sha }}
+          path: |
+            dist/Passthrify-${{ env.VERSION }}-linux-x86_64.tar.gz
+            dist/Passthrify-${{ env.VERSION }}-linux-x86_64.tar.gz.sha256
+            dist/Passthrify-${{ env.VERSION }}-x86_64.AppImage
+            dist/Passthrify-${{ env.VERSION }}-x86_64.AppImage.sha256
+          if-no-files-found: error
+
+  # The flake package (`nix build` / `nix run`) keeps building. Not needed for publishing.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: nix build
+        run: nix build -L --print-out-paths
+
+  # ---- Release (tag pushes and main) --------------------------------------------------------
+
+  publish:
+    needs: [version, windows, linux]
+    if: needs.version.outputs.kind != 'none'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      KIND: ${{ needs.version.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags for the patch notes
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Patch notes
-        if: steps.version.outputs.kind != 'none'
-        env:
-          KIND: ${{ steps.version.outputs.kind }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
           $tag = "v$env:VERSION"
@@ -148,7 +229,7 @@ jobs:
             ForEach-Object { "- $_" }
           if (-not $changes) { $changes = @('- Maintenance release.') }
 
-          $zip = "Passthrify-$env:VERSION.zip"
+          $v = $env:VERSION
           $notes = @("## Passthrify $tag", "")
           if ($env:KIND -eq 'dev') {
             $notes += "Automatic pre-release build of ``$($env:GITHUB_SHA.Substring(0, 7))`` on main."
@@ -160,17 +241,28 @@ jobs:
             $changes
             ""
             "### Download"
-            "- **Passthrify-$env:VERSION-setup.exe**: installs Passthrify for your user (no admin needed),"
+            ""
+            "**Windows** (10/11)"
+            "- **Passthrify-$v-setup.exe**: installs Passthrify for your user (no admin needed),"
             "  with a Start menu entry and an uninstaller. Windows may show a SmartScreen warning because"
             "  the installer isn't code-signed: click **More info → Run anyway**."
-            "- **$zip**: portable; unzip anywhere and run ``passthrify.exe``."
+            "- **Passthrify-$v.zip**: portable; unzip anywhere and run ``passthrify.exe``."
             ""
-            "Needs Windows 10/11, an NVIDIA GPU and an Elgato 4K-class capture card. Close Elgato 4K"
-            "Capture Utility / OBS first. Installed and portable copies both update themselves."
+            "**Linux** (x86_64, glibc 2.39+ such as Ubuntu 24.04 / Fedora 40 or newer, PipeWire)"
+            "- **Passthrify-$v-x86_64.AppImage**: one file; ``chmod +x`` it and run."
+            "- **Passthrify-$v-linux-x86_64.tar.gz**: unpack anywhere and run ``Passthrify/passthrify``."
+            "- Nix: ``nix run github:$env:GITHUB_REPOSITORY``."
             ""
-            "SHA-256 (setup): ``${{ steps.checksum.outputs.setup_sha256 }}``"
-            "SHA-256 (zip): ``${{ steps.checksum.outputs.sha256 }}``"
+            "Needs an NVIDIA GPU with its driver and an Elgato 4K-class capture card (on Linux any"
+            "V4L2/UVC capture card). Close Elgato 4K Capture Utility / OBS first. Installed, portable,"
+            "AppImage and tarball copies all update themselves."
+            ""
+            "### SHA-256"
           )
+          foreach ($f in Get-ChildItem dist -Filter '*.sha256' | Sort-Object Name) {
+            $hash, $name = (Get-Content $f.FullName -Raw).Trim() -split '\s+', 2
+            $notes += "- ``$name``: ``$hash``"
+          }
           if ($prev) {
             $notes += ""
             $notes += "**Full diff:** https://github.com/$env:GITHUB_REPOSITORY/compare/$prev...$tag"
@@ -180,24 +272,27 @@ jobs:
           $global:LASTEXITCODE = 0 # don't let the expected `git describe` miss fail the step
 
       - name: Publish release
-        if: steps.version.outputs.kind != 'none'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
+          tag_name: v${{ env.VERSION }}
           target_commitish: ${{ github.sha }}
-          name: Passthrify v${{ steps.version.outputs.version }}
+          name: Passthrify v${{ env.VERSION }}
           body_path: release-notes.md
-          prerelease: ${{ steps.version.outputs.kind == 'dev' || contains(steps.version.outputs.version, '-') }}
-          make_latest: ${{ steps.version.outputs.kind == 'release' && !contains(steps.version.outputs.version, '-') }}
+          prerelease: ${{ env.KIND == 'dev' || contains(env.VERSION, '-') }}
+          make_latest: ${{ env.KIND == 'release' && !contains(env.VERSION, '-') }}
           files: |
-            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe
-            dist/Passthrify-${{ steps.version.outputs.version }}-setup.exe.sha256
-            dist/Passthrify-${{ steps.version.outputs.version }}.zip
-            dist/Passthrify-${{ steps.version.outputs.version }}.zip.sha256
+            dist/Passthrify-${{ env.VERSION }}-setup.exe
+            dist/Passthrify-${{ env.VERSION }}-setup.exe.sha256
+            dist/Passthrify-${{ env.VERSION }}.zip
+            dist/Passthrify-${{ env.VERSION }}.zip.sha256
+            dist/Passthrify-${{ env.VERSION }}-x86_64.AppImage
+            dist/Passthrify-${{ env.VERSION }}-x86_64.AppImage.sha256
+            dist/Passthrify-${{ env.VERSION }}-linux-x86_64.tar.gz
+            dist/Passthrify-${{ env.VERSION }}-linux-x86_64.tar.gz.sha256
           fail_on_unmatched_files: true
 
       - name: Prune old dev builds
-        if: steps.version.outputs.kind == 'dev'
+        if: env.KIND == 'dev'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -339,13 +339,19 @@ struct Interop {
     memory: vk::DeviceMemory,
 }
 
+#[cfg(windows)]
+const EXT_MEMORY_EXT: &std::ffi::CStr = ash::khr::external_memory_win32::NAME;
+#[cfg(target_os = "linux")]
+const EXT_MEMORY_EXT: &std::ffi::CStr = ash::khr::external_memory_fd::NAME;
+
 impl Interop {
     fn shape(&self) -> (u32, u32, Chroma) {
         (self.target.width, self.target.height, self.target.chroma)
     }
 
     /// A buffer of `PREVIEW_SLOTS` frames in exportable device memory, imported into CUDA and
-    /// wrapped as a wgpu buffer. Needs wgpu on Vulkan with VK_KHR_external_memory_win32.
+    /// wrapped as a wgpu buffer. Needs wgpu on Vulkan with VK_KHR_external_memory_win32 (Windows)
+    /// or VK_KHR_external_memory_fd (Linux).
     fn create(device: &wgpu::Device, width: u32, height: u32, chroma: Chroma) -> anyhow::Result<Self> {
         use anyhow::{bail, Context};
         let (_, _, slot_size) = PreviewTarget::layout(width, height, chroma);
@@ -357,16 +363,19 @@ impl Interop {
                         d.raw_device().clone(),
                         d.raw_physical_device(),
                         d.shared_instance().raw_instance().clone(),
-                        d.enabled_device_extensions().contains(&ash::khr::external_memory_win32::NAME),
+                        d.enabled_device_extensions().contains(&EXT_MEMORY_EXT),
                     )
                 })
             })
         };
         let Some((dev, pdev, instance, has_ext)) = raw else { bail!("the preview isn't rendered with Vulkan") };
         if !has_ext {
-            bail!("VK_KHR_external_memory_win32 isn't available");
+            bail!("{} isn't available", EXT_MEMORY_EXT.to_string_lossy());
         }
+        #[cfg(windows)]
         let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
+        #[cfg(target_os = "linux")]
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
         unsafe {
             let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
             let info = vk::BufferCreateInfo::default()
@@ -404,13 +413,30 @@ impl Interop {
                 e
             };
             dev.bind_buffer_memory(buffer, memory, 0).map_err(|e| cleanup(anyhow::anyhow!("vkBindBufferMemory: {e}")))?;
-            let win32 = ash::khr::external_memory_win32::Device::new(&instance, &dev);
-            let handle = win32
-                .get_memory_win32_handle(&vk::MemoryGetWin32HandleInfoKHR::default().memory(memory).handle_type(handle_type))
-                .map_err(|e| cleanup(anyhow::anyhow!("vkGetMemoryWin32HandleKHR: {e}")))?;
-            // CUDA keeps its own reference; the handle itself is ours to close.
-            let target = PreviewTarget::import(handle as *mut std::ffi::c_void, req.size, width, height, chroma);
-            let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(handle as _));
+            #[cfg(windows)]
+            let target = {
+                let win32 = ash::khr::external_memory_win32::Device::new(&instance, &dev);
+                let handle = win32
+                    .get_memory_win32_handle(&vk::MemoryGetWin32HandleInfoKHR::default().memory(memory).handle_type(handle_type))
+                    .map_err(|e| cleanup(anyhow::anyhow!("vkGetMemoryWin32HandleKHR: {e}")))?;
+                // CUDA keeps its own reference; the handle itself is ours to close.
+                let target = PreviewTarget::import(handle as *mut std::ffi::c_void, req.size, width, height, chroma);
+                let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(handle as _));
+                target
+            };
+            #[cfg(target_os = "linux")]
+            let target = {
+                let fd_ext = ash::khr::external_memory_fd::Device::new(&instance, &dev);
+                let fd = fd_ext
+                    .get_memory_fd(&vk::MemoryGetFdInfoKHR::default().memory(memory).handle_type(handle_type))
+                    .map_err(|e| cleanup(anyhow::anyhow!("vkGetMemoryFdKHR: {e}")))?;
+                // A successful import hands the fd to CUDA; on failure it's still ours.
+                let target = PreviewTarget::import(fd, req.size, width, height, chroma);
+                if target.is_err() {
+                    libc::close(fd);
+                }
+                target
+            };
             let target = target.map_err(cleanup)?;
             let buffer = device.create_buffer_from_hal::<hal::api::Vulkan>(
                 hal::vulkan::Device::buffer_from_raw(buffer),
@@ -424,4 +450,65 @@ impl Interop {
             Ok(Self { target: Arc::new(target), buffer, device: dev, memory })
         }
     }
+}
+
+/// Linux: the wgpu device the UI renders with, created here rather than by eframe so it also
+/// enables VK_KHR_external_memory_fd, which wgpu doesn't turn on by itself but the preview
+/// buffer shared with CUDA needs ([`Interop::create`]). Same extensions, features and limits as
+/// eframe's own setup otherwise. None (eframe's setup, CPU uploads) if anything is missing.
+#[cfg(target_os = "linux")]
+pub fn linux_wgpu_setup() -> Option<egui_wgpu::WgpuSetup> {
+    let res = (|| -> anyhow::Result<egui_wgpu::WgpuSetup> {
+        use anyhow::{anyhow, Context};
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::from_build_config().with_env(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+        });
+        // Prefer the discrete GPU (the NVIDIA one, which CUDA and NVENC use).
+        let mut adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
+        adapters.sort_by_key(|a| match a.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
+        });
+        let adapter = adapters.into_iter().next().ok_or_else(|| anyhow!("no Vulkan adapter"))?;
+        let desc = wgpu::DeviceDescriptor {
+            label: Some("egui wgpu device"),
+            required_features: wgpu::Features::default(),
+            required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, ..wgpu::Limits::default() },
+            memory_hints: wgpu::MemoryHints::default(),
+        };
+        let open = unsafe {
+            adapter.as_hal::<hal::api::Vulkan, _, _>(|a| -> anyhow::Result<_> {
+                let a = a.ok_or_else(|| anyhow!("not a Vulkan adapter"))?;
+                let raw_instance = a.shared_instance().raw_instance();
+                let mut exts = a.required_device_extensions(desc.required_features);
+                let available = raw_instance
+                    .enumerate_device_extension_properties(a.raw_physical_device())
+                    .context("listing device extensions")?;
+                let fd = ash::khr::external_memory_fd::NAME;
+                if !available.iter().any(|e| e.extension_name_as_c_str() == Ok(fd)) {
+                    anyhow::bail!("the GPU doesn't offer {}", fd.to_string_lossy());
+                }
+                if !exts.contains(&fd) {
+                    exts.push(fd);
+                }
+                let mut features = a.physical_device_features(&exts, desc.required_features);
+                let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
+                let names: Vec<_> = exts.iter().map(|e| e.as_ptr()).collect();
+                let info = features.add_to_device_create(
+                    vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&names),
+                );
+                let raw = raw_instance.create_device(a.raw_physical_device(), &info, None).context("vkCreateDevice")?;
+                a.device_from_raw(raw, None, &exts, desc.required_features, &desc.memory_hints, 0, 0)
+                    .map_err(|e| anyhow!("wrapping the Vulkan device: {e}"))
+            })?
+        };
+        let (device, queue) = unsafe { adapter.create_device_from_hal(open, &desc, None) }.context("creating the wgpu device")?;
+        tracing::info!("UI on {} (Vulkan, with external memory for the preview)", adapter.get_info().name);
+        Ok(egui_wgpu::WgpuSetup::Existing(egui_wgpu::WgpuSetupExisting { instance, adapter, device, queue }))
+    })();
+    res.map_err(|e| tracing::warn!("Vulkan device with external memory unavailable ({e:#}); the preview uploads from the CPU"))
+        .ok()
 }

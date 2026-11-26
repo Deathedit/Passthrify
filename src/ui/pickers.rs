@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::capture::video_mf::VideoMode;
+use crate::capture::VideoMode;
 use crate::config::{Chroma, Codec, ModePref};
 
 fn fps_key(f: f64) -> u32 {
@@ -92,7 +92,7 @@ pub fn resolution_picker(
         (None, Some(m)) => format!("Auto ({}x{})", m.width, m.height),
         (None, None) => "Auto".into(),
     };
-    egui::ComboBox::from_id_salt(format!("{id}_res")).selected_text(text).width(width).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(format!("{id}_res")).selected_text(text).width(width).truncate().show_ui(ui, |ui| {
         if ui.selectable_label(pref.is_none(), "Auto (best)").clicked() && pref.is_some() {
             *pref = None;
             changed = true;
@@ -134,7 +134,7 @@ pub fn rate_picker(
         (None, None) => "Auto".into(),
     };
     ui.add_enabled_ui(!available.is_empty(), |ui| {
-        egui::ComboBox::from_id_salt(format!("{id}_fps")).selected_text(text).width(width).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(format!("{id}_fps")).selected_text(text).width(width).truncate().show_ui(ui, |ui| {
             for f in available {
                 let selected = pref.is_some_and(|p| fps_key(p.fps) == fps_key(f));
                 if ui.selectable_label(selected, fmt_fps(f)).clicked() && !selected {
@@ -150,7 +150,7 @@ pub fn rate_picker(
 pub fn codec_picker(ui: &mut egui::Ui, id: &str, codec: &mut Codec, chroma: Chroma, short: bool, width: f32) -> bool {
     let mut changed = false;
     let label = |c: Codec| if short { c.short_label() } else { c.label() };
-    egui::ComboBox::from_id_salt(format!("{id}_codec")).selected_text(label(*codec)).width(width).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(format!("{id}_codec")).selected_text(label(*codec)).width(width).truncate().show_ui(ui, |ui| {
         for c in Codec::ALL {
             let ok = c.supports(chroma);
             let resp = ui
@@ -183,7 +183,7 @@ pub fn chroma_picker(
         Some(a) if a != *chroma => format!("{} → {}", chroma.label(), a.label()),
         _ => chroma.label().to_string(),
     };
-    let resp = egui::ComboBox::from_id_salt(format!("{id}_chroma")).selected_text(text).width(width).show_ui(ui, |ui| {
+    let resp = egui::ComboBox::from_id_salt(format!("{id}_chroma")).selected_text(text).width(width).truncate().show_ui(ui, |ui| {
         for c in Chroma::ALL {
             let top = resolutions(modes, c).first().copied();
             let offered = modes.is_empty() || top.is_some();
@@ -210,17 +210,20 @@ pub fn chroma_picker(
             }
         }
     });
-    resp.response.on_hover_text(
+    resp.response.on_hover_text(if cfg!(windows) {
         "Chroma subsampling. The resolution and frame-rate lists show only modes that deliver it.\n\
-         4:2:2 / 4:4:4 files need VLC, mpv, MPC-HC or a pro editor; Windows' built-in player only decodes 4:2:0.",
-    );
+         4:2:2 / 4:4:4 files need VLC, mpv, MPC-HC or a pro editor; Windows' built-in player only decodes 4:2:0."
+    } else {
+        "Chroma subsampling. The resolution and frame-rate lists show only modes that deliver it.\n\
+         4:2:2 / 4:4:4 files need mpv, VLC or a pro editor; many players and browsers only decode 4:2:0."
+    });
     changed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::video_mf::PixFmt;
+    use crate::capture::PixFmt;
 
     fn m(w: u32, h: u32, num: u32, den: u32, format: PixFmt) -> VideoMode {
         VideoMode { index: 0, width: w, height: h, fps_num: num, fps_den: den, format }
